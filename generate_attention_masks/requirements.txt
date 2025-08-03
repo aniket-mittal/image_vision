@@ -1,0 +1,37 @@
+# Unified Environment Requirements for CLIP + LLaVA
+# Tested and working configuration
+
+# Core PyTorch Stack (LLaVA-compatible versions)
+torch==2.0.1
+torchvision==0.15.2
+numpy<2  # Critical: Must be <2 for PyTorch compatibility
+
+# Transformers and HuggingFace (LLaVA requirements)
+transformers==4.31.0
+accelerate==0.21.0
+bitsandbytes==0.41.0
+peft==0.4.0
+sentencepiece==0.1.99
+
+# CLIP-specific dependencies
+timm==0.6.13
+einops==0.6.1
+einops-exts==0.0.4
+ftfy>=6.0.0
+regex>=2022.0.0
+scipy>=1.9.0
+scikit-image>=0.19.0
+opencv-python>=4.6.0  # Will have numpy warning but works
+h5py>=3.7.0
+imageio>=2.19.0
+scikit-learn==1.2.2
+
+# Optional: Performance optimizations
+flash-attn>=2.0.0
+xformers>=0.0.20
+
+# Utilities
+tqdm>=4.64.0
+matplotlib>=3.5.0
+requests>=2.25.0
+Pillow>=9.0.0
