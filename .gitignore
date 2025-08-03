@@ -199,8 +199,6 @@ models/
 
 # Archive files
 *.zip
-*.tar
-*.gz
 *.rar
 *.7z
 
