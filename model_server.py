@@ -282,51 +282,65 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(e)})
 
         if endpoint == "segmentation":
+            image_path = ensure_image_path(payload)
+            query = payload.get("query", "object")
+            blur_strength = int(payload.get("blur_strength", 15))
+            padding = int(payload.get("padding", 20))
+            mask_type = payload.get("mask_type", "precise")
+            if not image_path or not os.path.exists(image_path):
+                return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+            pil = Image.open(image_path).convert("RGB")
+            width, height = pil.size
+            print("[ModelServer] Segmentation start", {"query": query, "mask_type": mask_type})
+
+            combined = None
+            # Try text-prompted detection first
             try:
-                image_path = ensure_image_path(payload)
-                query = payload.get("query", "object")
-                blur_strength = int(payload.get("blur_strength", 15))
-                padding = int(payload.get("padding", 20))
-                mask_type = payload.get("mask_type", "precise")
-                if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
-                pil = Image.open(image_path).convert("RGB")
-                width, height = pil.size
-                print("[ModelServer] Segmentation start", {"query": query, "mask_type": mask_type})
                 masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query)
-                if not masks:
+                if masks:
+                    combined = np.zeros((height, width), dtype=np.float32)
+                    for m in masks:
+                        if m.ndim == 3 and m.shape[0] == 1:
+                            m = m[0]
+                        combined = np.maximum(combined, m)
+            except Exception as e:
+                print("[ModelServer] Segmentation GroundedDINO error, will fallback to SAM auto:", e)
+
+            # Fallback to SAM auto (no text) if needed
+            if combined is None:
+                objs = sam_auto_objects(pil, max_masks=10)
+                if not objs:
                     return self._send(200, {"processedImageData": None, "objects": [], "note": "no objects"})
                 combined = np.zeros((height, width), dtype=np.float32)
-                for m in masks:
+                for m, _bbox in objs:
                     if m.ndim == 3 and m.shape[0] == 1:
                         m = m[0]
                     combined = np.maximum(combined, m)
-                if mask_type == "oval":
-                    # create oval mask around union bbox with padding
-                    import cv2
-                    ys, xs = np.where(combined > 0)
-                    if ys.size == 0:
-                        mask_final = np.zeros_like(combined)
-                    else:
-                        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-                        x1 = max(0, x1 - padding)
-                        y1 = max(0, y1 - padding)
-                        x2 = min(width - 1, x2 + padding)
-                        y2 = min(height - 1, y2 + padding)
-                        center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                        axes = (max(1, int((x2 - x1) / 2)), max(1, int((y2 - y1) / 2)))
-                        mask_final = np.zeros_like(combined, dtype=np.uint8)
-                        cv2.ellipse(mask_final, center, axes, 0, 0, 360, 1, -1)
-                        mask_final = mask_final.astype(np.float32)
+
+            # Build final mask according to mode
+            if mask_type == "oval":
+                import cv2
+                ys, xs = np.where(combined > 0)
+                if ys.size == 0:
+                    mask_final = np.zeros_like(combined)
                 else:
-                    mask_final = combined
-                masked = apply_blur_with_mask(pil, mask_final, blur_strength)
-                b64 = np_to_jpeg_base64(masked)
-                print("[ModelServer] Segmentation done")
-                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
-            except Exception as e:
-                print("[ModelServer] Segmentation error", e)
-                return self._send(500, {"error": str(e)})
+                    x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    x2 = min(width - 1, x2 + padding)
+                    y2 = min(height - 1, y2 + padding)
+                    center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                    axes = (max(1, int((x2 - x1) / 2)), max(1, int((y2 - y1) / 2)))
+                    mask_final = np.zeros_like(combined, dtype=np.uint8)
+                    cv2.ellipse(mask_final, center, axes, 0, 0, 360, 1, -1)
+                    mask_final = mask_final.astype(np.float32)
+            else:
+                mask_final = combined
+
+            masked = apply_blur_with_mask(pil, mask_final, blur_strength)
+            b64 = np_to_jpeg_base64(masked)
+            print("[ModelServer] Segmentation done")
+            return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
 
         return self._send(404, {"error": "not found"})
 
