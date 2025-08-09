@@ -99,6 +99,19 @@ def mask_bbox(mask: np.ndarray):
         return [0, 0, int(mask.shape[1]), int(mask.shape[0])]
     return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
+def ensure_foreground_mask(mask: np.ndarray) -> np.ndarray:
+    """Normalize mask to float32 in [0,1] where 1 means KEEP SHARP (object), 0 means BLUR.
+    If the mask covers more than half the image, assume it's inverted and flip it.
+    """
+    m = mask.astype(np.float32)
+    if m.ndim == 3 and m.shape[0] == 1:
+        m = m[0]
+    m = np.clip(m, 0, 1)
+    # Heuristic flip if majority of pixels are 1 (likely background selected)
+    if m.mean() > 0.5:
+        m = 1.0 - m
+    return m
+
 def sam_auto_objects(pil: Image.Image, max_masks: int = 20):
     """Generate object masks using SAM automatic mask generator (no text).
     Returns list of (mask ndarray, bbox [x1,y1,x2,y2]).
