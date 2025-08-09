@@ -29,6 +29,8 @@ for p in [_GSA_DIR, _GSA_DINO_DIR, _GSA_DINO_PKG_DIR, _GSA_SAM_DIR]:
 
 from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
 import numpy as np
+import tempfile
+import time
 
 DETECTOR = GroundedSAMDetector()
 print("[ModelServer] GroundedSAMDetector loaded")
@@ -37,6 +39,38 @@ def np_to_jpeg_base64(img: Image.Image) -> str:
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def ensure_image_path(payload: dict) -> str:
+    """Return a local image path for processing.
+    Prefer 'image_data' (data URL or base64). If not provided, try 'image_path'.
+    """
+    image_data = payload.get("image_data")
+    if image_data:
+        # handle data URL or pure base64
+        if isinstance(image_data, str) and image_data.startswith("data:image/"):
+            try:
+                _, b64 = image_data.split(",", 1)
+            except ValueError:
+                b64 = image_data
+        else:
+            b64 = image_data
+        try:
+            data = base64.b64decode(b64)
+        except Exception:
+            # sometimes clients double-wrap base64; try to parse JSON or nested fields
+            try:
+                nested = json.loads(image_data)
+                return ensure_image_path({"image_data": nested.get("image_data")})
+            except Exception:
+                raise
+        tmp_dir = tempfile.gettempdir()
+        ts = int(time.time() * 1000)
+        p = os.path.join(tmp_dir, f"ms_img_{ts}.jpg")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+    image_path = payload.get("image_path")
+    return image_path or ""
 
 def apply_blur_with_mask(image: Image.Image, mask: np.ndarray, blur_strength: int = 15) -> Image.Image:
     import cv2
@@ -75,22 +109,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
+        path = parsed.path.rstrip("/") or "/"
+        endpoint = path.split("/")[-1]
+        if endpoint == "health":
             return self._send(200, {"status": "ok"})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        endpoint = path.split("/")[-1]
         length = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(length).decode("utf-8")
-        try:
-            payload = json.loads(data) if data else {}
-        except Exception as e:
-            return self._send(400, {"error": f"invalid json: {e}"})
-
-        if parsed.path == "/attention":
             try:
-                image_path = payload.get("image_path")
+                payload = json.loads(data) if data else {}
+            except Exception as e:
+                return self._send(400, {"error": f"invalid json: {e}", "raw": data[:200]})
+
+        if endpoint == "attention":
+            try:
+                image_path = ensure_image_path(payload)
                 query = payload.get("query", "")
                 layer_index = int(payload.get("layer_index", 22))
                 enhancement_control = float(payload.get("enhancement_control", 5.0))
@@ -100,51 +138,46 @@ class Handler(BaseHTTPRequestHandler):
                 output_dir = payload.get("output_dir", "temp_output")
 
                 if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path"})
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
 
-                # Update layer index if changed
+                # Update model if requested layer index changed
                 if CLIP_GEN.layer_index != layer_index:
-                    # reload hooks to the requested layer
-                    CLIP_GEN.layer_index = layer_index
-                    # reinitialize model hooks
-                    CLIP_GEN.model, CLIP_GEN.prs, CLIP_GEN.preprocess, CLIP_GEN.device, CLIP_GEN.tokenizer = (
-                        CLIPMaskGenerator(
-                            model_name=CLIP_GEN.model_name,
-                            layer_index=layer_index,
-                            device=CLIP_GEN.device,
-                        ).model,
-                        CLIPMaskGenerator(
-                            model_name=CLIP_GEN.model_name,
-                            layer_index=layer_index,
-                            device=CLIP_GEN.device,
-                        ).prs,
-                        CLIPMaskGenerator(
-                            model_name=CLIP_GEN.model_name,
-                            layer_index=layer_index,
-                            device=CLIP_GEN.device,
-                        ).preprocess,
-                        CLIPMaskGenerator(
-                            model_name=CLIP_GEN.model_name,
-                            layer_index=layer_index,
-                            device=CLIP_GEN.device,
-                        ).device,
-                        CLIPMaskGenerator(
-                            model_name=CLIP_GEN.model_name,
-                            layer_index=layer_index,
-                            device=CLIP_GEN.device,
-                        ).tokenizer,
-                    )
+                    print(f"[ModelServer] Reinitializing CLIP with layer_index={layer_index}")
+                    from generate_attention_masks.clip_api.clip_model import CLIPMaskGenerator as _CMG
+                    global CLIP_GEN
+                    CLIP_GEN = _CMG(model_name=CLIP_GEN.model_name, layer_index=layer_index, device=CLIP_GEN.device)
 
                 print("[ModelServer] Attention inference start", {"query": query, "layer_index": layer_index})
-                images, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
-                pil_image = Image.open(image_path).convert("RGB")
-                masked_image, _ = CLIP_GEN.create_masked_image(
-                    pil_image,
-                    attention_maps[0],
-                    token_maps[0],
-                    grayscale_level=grayscale_level,
-                    overlay_strength=overlay_strength,
-                )
+                masked_image = None
+                try:
+                    images, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
+                    if attention_maps and token_maps:
+                        pil_image = Image.open(image_path).convert("RGB")
+                        masked_image, _ = CLIP_GEN.create_masked_image(
+                            pil_image,
+                            attention_maps[0],
+                            token_maps[0],
+                            grayscale_level=grayscale_level,
+                            overlay_strength=overlay_strength,
+                        )
+                except Exception as inner_e:
+                    print("[ModelServer] CLIP_GEN path failed; will try fallback", inner_e)
+
+                # Fallback to GroundedSAM if CLIP attention fails
+                if masked_image is None:
+                    print("[ModelServer] Using GroundedSAM fallback for attention")
+                    pil = Image.open(image_path).convert("RGB")
+                    width, height = pil.size
+                    masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query or "object")
+                    if not masks:
+                        return self._send(200, {"processedImageData": None, "note": "no objects for fallback"})
+                    import numpy as _np
+                    combined = _np.zeros((height, width), dtype=_np.float32)
+                    for m in masks:
+                        if m.ndim == 3 and m.shape[0] == 1:
+                            m = m[0]
+                        combined = _np.maximum(combined, m)
+                    masked_image = apply_blur_with_mask(pil, combined, blur_strength=15)
 
                 os.makedirs(output_dir, exist_ok=True)
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -158,12 +191,12 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] Attention inference error", e)
                 return self._send(500, {"error": str(e)})
 
-        if parsed.path == "/detect_all":
+        if endpoint == "detect_all":
             try:
-                image_path = payload.get("image_path")
+                image_path = ensure_image_path(payload)
                 prompt = payload.get("prompt", "object")
                 if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path"})
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
                 pil = Image.open(image_path).convert("RGB")
                 width, height = pil.size
                 print("[ModelServer] Detect_all start", {"prompt": prompt})
@@ -183,14 +216,14 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] Detect_all error", e)
                 return self._send(500, {"error": str(e)})
 
-        if parsed.path == "/sam_click":
+        if endpoint == "sam_click":
             try:
-                image_path = payload.get("image_path")
+                image_path = ensure_image_path(payload)
                 x = int(payload.get("x", 0))
                 y = int(payload.get("y", 0))
                 blur_strength = int(payload.get("blur_strength", 15))
                 if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path"})
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
                 pil = Image.open(image_path).convert("RGB")
                 image_np = np.array(pil)
                 DETECTOR.sam_predictor.set_image(image_np)
@@ -211,15 +244,15 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] SAM-click error", e)
                 return self._send(500, {"error": str(e)})
 
-        if parsed.path == "/segmentation":
+        if endpoint == "segmentation":
             try:
-                image_path = payload.get("image_path")
+                image_path = ensure_image_path(payload)
                 query = payload.get("query", "object")
                 blur_strength = int(payload.get("blur_strength", 15))
                 padding = int(payload.get("padding", 20))
                 mask_type = payload.get("mask_type", "precise")
                 if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path"})
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
                 pil = Image.open(image_path).convert("RGB")
                 width, height = pil.size
                 print("[ModelServer] Segmentation start", {"query": query, "mask_type": mask_type})
