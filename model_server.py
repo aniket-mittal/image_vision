@@ -31,6 +31,7 @@ from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
 import numpy as np
 import tempfile
 import time
+from segment_anything import SamAutomaticMaskGenerator
 
 DETECTOR = GroundedSAMDetector()
 print("[ModelServer] GroundedSAMDetector loaded")
@@ -96,6 +97,27 @@ def mask_bbox(mask: np.ndarray):
     if ys.size == 0 or xs.size == 0:
         return [0, 0, int(mask.shape[1]), int(mask.shape[0])]
     return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+def sam_auto_objects(pil: Image.Image, max_masks: int = 20):
+    """Generate object masks using SAM automatic mask generator (no text).
+    Returns list of (mask ndarray, bbox [x1,y1,x2,y2]).
+    """
+    gen = SamAutomaticMaskGenerator(DETECTOR.sam)
+    image_np = np.array(pil)
+    data = gen.generate(image_np)
+    objs = []
+    count = 0
+    for d in sorted(data, key=lambda x: x.get("area", 0), reverse=True):
+        seg = d.get("segmentation")
+        if seg is None:
+            continue
+        m = seg.astype(np.float32)
+        bbox = mask_bbox(m)
+        objs.append((m, bbox))
+        count += 1
+        if count >= max_masks:
+            break
+    return objs
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -163,23 +185,24 @@ class Handler(BaseHTTPRequestHandler):
                 # If CLIP path fails (e.g., torchvision C++ ops issues), log and fallback to SAM
                 print("[ModelServer] CLIP path failed; using GroundedSAM fallback:", inner_e)
 
-            # Fallback to GroundedSAM if CLIP attention fails
+            # Fallback to GroundedSAM + SAM auto if CLIP attention fails
             if masked_image is None:
                 try:
-                    print("[ModelServer] Using GroundedSAM fallback for attention")
+                    print("[ModelServer] Using SAM auto fallback for attention")
                     pil = Image.open(image_path).convert("RGB")
-                    width, height = pil.size
-                    masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query or "object")
-                    if masks:
-                        import numpy as _np
-                        combined = _np.zeros((height, width), dtype=_np.float32)
-                        for m in masks:
+                    objs = sam_auto_objects(pil, max_masks=10)
+                    if objs:
+                        height, width = np.array(pil).shape[:2]
+                        combined = np.zeros((height, width), dtype=np.float32)
+                        for m, _bbox in objs:
                             if m.ndim == 3 and m.shape[0] == 1:
                                 m = m[0]
-                            combined = _np.maximum(combined, m)
+                            combined = np.maximum(combined, m)
                         masked_image = apply_blur_with_mask(pil, combined, blur_strength=15)
                     else:
-                        return self._send(200, {"processedImageData": None, "note": "no objects for fallback"})
+                        # last resort: return original image
+                        masked_image = pil
+                        print("[ModelServer] SAM auto produced no masks; returning original image")
                 except Exception as se:
                     print("[ModelServer] SAM fallback failed:", se)
                     return self._send(500, {"error": str(se)})
@@ -193,16 +216,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
 
         if endpoint == "detect_all":
+            image_path = ensure_image_path(payload)
+            prompt = payload.get("prompt", "object")
+            if not image_path or not os.path.exists(image_path):
+                return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+            pil = Image.open(image_path).convert("RGB")
+            width, height = pil.size
+            print("[ModelServer] Detect_all start", {"prompt": prompt})
+            objects = []
             try:
-                image_path = ensure_image_path(payload)
-                prompt = payload.get("prompt", "object")
-                if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
-                pil = Image.open(image_path).convert("RGB")
-                width, height = pil.size
-                print("[ModelServer] Detect_all start", {"prompt": prompt})
+                # Prefer textual detect when extensions are working
                 masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
-                objects = []
                 for idx, box in enumerate(boxes):
                     cx, cy, w_norm, h_norm = box
                     x1 = max(0, int((cx - w_norm / 2) * width))
@@ -211,11 +235,14 @@ class Handler(BaseHTTPRequestHandler):
                     y2 = min(height, int((cy + h_norm / 2) * height))
                     label = phrases[idx] if idx < len(phrases) else "object"
                     objects.append({"id": idx, "bbox": [x1, y1, x2, y2], "label": label})
-                print("[ModelServer] Detect_all done", {"count": len(objects)})
-                return self._send(200, {"image": {"width": width, "height": height}, "objects": objects})
             except Exception as e:
-                print("[ModelServer] Detect_all error", e)
-                return self._send(500, {"error": str(e)})
+                # Fallback to SAM auto if GroundingDINO C++ ops are missing (_C not defined)
+                print("[ModelServer] Detect_all fallback via SAM auto:", e)
+                objs = sam_auto_objects(pil)
+                for idx, (_m, bbox) in enumerate(objs):
+                    objects.append({"id": idx, "bbox": bbox, "label": "object"})
+            print("[ModelServer] Detect_all done", {"count": len(objects)})
+            return self._send(200, {"image": {"width": width, "height": height}, "objects": objects})
 
         if endpoint == "sam_click":
             try:
