@@ -78,6 +78,19 @@ async function runOCR(imagePath: string) {
   return data as { text: string; blocks: Array<{ text: string; bbox: number[]; confidence: number }> }
 }
 
+async function runOCRFocus(imagePath: string, region: "title" | "x_axis" | "y_axis" | "legend", blur_strength = 15) {
+  const body = {
+    image_data: await import("fs/promises").then((fs) =>
+      fs.readFile(imagePath).then((b) => `data:image/jpeg;base64,${b.toString("base64")}`),
+    ),
+    region,
+    blur_strength,
+  }
+  const r = await fetch(`${MODEL_SERVER_URL}/ocr_focus`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  if (!r.ok) throw new Error(`ocr_focus ${r.status}: ${await r.text()}`)
+  return r.json() as Promise<{ processedImageData: string; layout: any; region: string }>
+}
+
 function maxIterations(mode: DepthMode) {
   return mode === "BlurDeep" ? 20 : 5
 }
@@ -105,11 +118,25 @@ export async function POST(req: NextRequest) {
       console.warn("OCR failed", e)
     }
 
+    // Prepare OCR summary for prompts
+    const ocrSummary = (() => {
+      try {
+        const c = (ocr as any)?.layout?.candidates || {}
+        const title = c?.title ? "yes" : "no"
+        const xt = Array.isArray(c?.x_axis_ticks) ? c.x_axis_ticks.length : 0
+        const yt = Array.isArray(c?.y_axis_ticks) ? c.y_axis_ticks.length : 0
+        const lg = Array.isArray(c?.legend_candidates) ? c.legend_candidates.length : 0
+        return `layout -> title:${title}, x_ticks:${xt}, y_ticks:${yt}, legend_boxes:${lg}`
+      } catch {
+        return "layout -> unknown"
+      }
+    })()
+
     // Initialize planner prompt
     const sysPlanner = {
       role: "system",
       content:
-        "You are a vision planning agent. You decide, step by step, where to look using attention or segmentation masking. You may tune parameters (blur_strength, padding, mask_type; layer_index, enhancement_control, smoothing_kernel, overlay_strength, grayscale_level). Use concise JSON outputs only. Consider OCR when text is relevant.",
+        "You are a vision planning agent. You decide, step by step, where to look using attention or segmentation masking. You may tune parameters (blur_strength, padding, mask_type; layer_index, enhancement_control, smoothing_kernel, overlay_strength, grayscale_level). Use concise JSON outputs only. When OCR indicates chart-like structure (title/x-axis/y-axis/legend), exploit spatial relations (e.g., look above/below/left/right of labeled text) to focus the view.",
     }
     const sysVerifier = {
       role: "system",
@@ -141,7 +168,7 @@ export async function POST(req: NextRequest) {
       // Ask planner what to do next
       const plannerUser = {
         role: "user",
-        content: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nPrevious technique: ${lastTechnique || "<none>"}\nPrevious params: ${JSON.stringify(lastParams)}\nVerifier suggestion: ${lastSuggestion || "<none>"}\nUser provided ROI: ${selection ? JSON.stringify(selection) : "<none>"}\nStep ${i + 1} of ${iters}. Respond as JSON: {"technique":"attention|segmentation","refinedQuery":"...","params":{...},"rationale":"..."}`,
+        content: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nPrevious technique: ${lastTechnique || "<none>"}\nPrevious params: ${JSON.stringify(lastParams)}\nVerifier suggestion: ${lastSuggestion || "<none>"}\nUser provided ROI: ${selection ? JSON.stringify(selection) : "<none>"}\nSub-questions (if any) will be provided later to the final answer. Step ${i + 1} of ${iters}. Respond as JSON: {"technique":"attention|segmentation","refinedQuery":"...","params":{...},"rationale":"..."}`,
       }
       const plannerResp = await callOpenAI([sysPlanner, plannerUser], 400)
       const plannerContent: string = plannerResp.choices?.[0]?.message?.content || "{}"
@@ -151,6 +178,24 @@ export async function POST(req: NextRequest) {
         plan = JSON.parse(clean)
       } catch {
         plan = { technique: "attention", refinedQuery: userQuery, params: {}, rationale: "fallback" }
+      }
+
+      // Special handling for charts/graphs: if OCR suggests structured labels, allow a text-region focus before tools
+      if (ocr?.layout?.candidates && i === 0) {
+        try {
+          // Pick a heuristic region based on question keywords
+          const q = userQuery.toLowerCase()
+          let region: "title" | "x_axis" | "y_axis" | "legend" | null = null
+          if (q.includes("title")) region = "title"
+          else if (q.includes("x-axis") || q.includes("x axis") || q.includes("horizontal")) region = "x_axis"
+          else if (q.includes("y-axis") || q.includes("y axis") || q.includes("vertical")) region = "y_axis"
+          else if (q.includes("legend")) region = "legend"
+          if (region) {
+            const of = await runOCRFocus(imagePath, region)
+            steps.push({ processedImageData: of.processedImageData, technique: "segmentation", refinedQuery: `${region} text region`, params: { region } })
+            lastProcessed = of.processedImageData
+          }
+        } catch {}
       }
 
       // Execute tool call
@@ -170,7 +215,7 @@ export async function POST(req: NextRequest) {
       const verifierUser = {
         role: "user",
         content: [
-          { type: "text", text: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nCurrent technique: ${plan.technique}\nRefined query: ${plan.refinedQuery}\nParams: ${JSON.stringify(plan.params)}\nReturn JSON: {"score":0-1,"good":true|false,"suggestion":"..."}` },
+          { type: "text", text: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nCurrent technique: ${plan.technique}\nRefined query: ${plan.refinedQuery}\nParams: ${JSON.stringify(plan.params)}\nReturn JSON: {"score":0-1,"good":true|false,"suggestion":"..."}` },
           { type: "image_url", image_url: { url: processed } },
         ],
       }
@@ -199,17 +244,28 @@ export async function POST(req: NextRequest) {
       // Planner will adapt next iteration implicitly as it receives previous step context
     }
 
+    // Query decomposition: expand the user's question into sub-questions to gather more context
+    const decomposeSys = { role: "system", content: "Decompose the user's visual question into the smallest useful sub-questions to fully answer it. Return strict JSON: {\"subQuestions\":[\"...\"]}." }
+    const decomposeUser = { role: "user", content: `Question: ${userQuery}` }
+    let subQuestions: string[] = []
+    try {
+      const d = await callOpenAI([decomposeSys, decomposeUser], 250)
+      const dc = (d.choices?.[0]?.message?.content || "{}").replace(/```json\n?/g, "").replace(/```\n?/g, "").trim()
+      const parsed = JSON.parse(dc)
+      if (Array.isArray(parsed?.subQuestions)) subQuestions = parsed.subQuestions
+    } catch {}
+
     // Final answering on the best/last processed view
     const finalImage = lastProcessed || imageData
     const finalMessages = [
       {
         role: "system",
-        content: `You are an expert vision assistant. Provide a precise, well-grounded answer. If text in the scene matters, incorporate OCR context if relevant.`,
+        content: `You are an expert vision assistant. Provide a precise, well-grounded answer. If text in the scene matters, incorporate OCR context if relevant. Consider the sub-questions provided to structure your reasoning if helpful.`,
       },
       {
         role: "user",
         content: [
-          { type: "text", text: `Question: ${userQuery}\nRefined: ${lastRefined || userQuery}\nTechnique: ${lastTechnique}\nOCR: ${ocr.text || "<none>"}` },
+          { type: "text", text: `Question: ${userQuery}\nRefined: ${lastRefined || userQuery}\nTechnique: ${lastTechnique}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nSub-questions: ${subQuestions.length ? subQuestions.join(" | ") : "<none>"}` },
           { type: "image_url", image_url: { url: finalImage } },
         ],
       },

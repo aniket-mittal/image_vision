@@ -54,11 +54,111 @@ def _ensure_easyocr():
 def _pytesseract_ocr(pil_img: Image.Image):
     try:
         import pytesseract  # type: ignore
-        text = pytesseract.image_to_string(pil_img)
-        return text, []
+        data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
+        n = len(data.get("text", []))
+        blocks = []
+        texts = []
+        for i in range(n):
+            t = (data["text"][i] or "").strip()
+            if not t:
+                continue
+            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            conf = float(data.get("conf", [0]*n)[i] or 0)
+            blocks.append({"text": t, "bbox": [int(x), int(y), int(x + w), int(y + h)], "confidence": conf/100.0})
+            texts.append(t)
+        text = "\n".join(texts)
+        return text, blocks
     except Exception as e:
         print("[ModelServer] pytesseract unavailable:", e)
         return "", []
+
+def ocr_blocks_from_image(pil: Image.Image):
+    # Try easyocr first
+    reader = _ensure_easyocr()
+    if reader and reader is not False:
+        try:
+            results = reader.readtext(np.array(pil))
+            blocks = []
+            texts = []
+            for (bbox, t, conf) in results:
+                if not t:
+                    continue
+                xs = [int(p[0]) for p in bbox]
+                ys = [int(p[1]) for p in bbox]
+                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                blocks.append({"text": t, "bbox": [x1, y1, x2, y2], "confidence": float(conf)})
+                texts.append(t)
+            return "\n".join(texts), blocks
+        except Exception as e:
+            print("[ModelServer] easyocr readtext failed:", e)
+    # Fallback
+    return _pytesseract_ocr(pil)
+
+def summarize_ocr_layout(pil: Image.Image, blocks: list):
+    import re
+    width, height = pil.size
+    if not blocks:
+        return {"image": {"width": width, "height": height}, "blocks": [], "candidates": {}}
+    # Normalize and basic clustering
+    norm_blocks = []
+    for b in blocks:
+        x1, y1, x2, y2 = b["bbox"]
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        norm_blocks.append({
+            "text": b["text"],
+            "bbox": b["bbox"],
+            "norm": {
+                "x1": x1 / width,
+                "y1": y1 / height,
+                "x2": x2 / width,
+                "y2": y2 / height,
+                "cx": cx / width,
+                "cy": cy / height,
+            },
+            "confidence": float(b.get("confidence", 0.0)),
+        })
+    # Heuristics
+    top = [b for b in norm_blocks if b["norm"]["y1"] < 0.2]
+    bottom = [b for b in norm_blocks if b["norm"]["y2"] > 0.8]
+    left = [b for b in norm_blocks if b["norm"]["x1"] < 0.15]
+    right = [b for b in norm_blocks if b["norm"]["x2"] > 0.85]
+    def longest(bylist):
+        return max(bylist, key=lambda b: len(b["text"]), default=None)
+    title = longest(top)
+    # Tick-like texts: mostly numeric/small tokens
+    def is_tick(t):
+        t = t.strip()
+        if not t:
+            return False
+        # numbers, short tokens, or percent/units
+        return bool(re.fullmatch(r"[\d\-+.,%:/ ]{1,8}", t)) or len(t) <= 3
+    x_ticks = [b for b in bottom if is_tick(b["text"])]
+    y_ticks = [b for b in left if is_tick(b["text"])]
+    legend = right[:5] if len(right) else []
+    return {
+        "image": {"width": width, "height": height},
+        "blocks": norm_blocks,
+        "candidates": {
+            "title": title,
+            "x_axis_ticks": x_ticks[:15],
+            "y_axis_ticks": y_ticks[:15],
+            "legend_candidates": legend,
+        },
+    }
+
+def rect_mask(width: int, height: int, x1: int, y1: int, x2: int, y2: int):
+    m = np.zeros((height, width), dtype=np.float32)
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(0, min(x2, width - 1))
+    y2 = max(0, min(y2, height - 1))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    m[y1:y2+1, x1:x2+1] = 1.0
+    return m
 
 def np_to_jpeg_base64(img: Image.Image) -> str:
     buf = BytesIO()
@@ -266,30 +366,48 @@ class Handler(BaseHTTPRequestHandler):
                 if not image_path or not os.path.exists(image_path):
                     return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
                 pil = Image.open(image_path).convert("RGB")
-                # Try easyocr first
-                reader = _ensure_easyocr()
-                text = ""
-                blocks = []
-                if reader and reader is not False:
-                    try:
-                        results = reader.readtext(np.array(pil))
-                        # results: list of (bbox, text, confidence)
-                        for (bbox, t, conf) in results:
-                            # bbox is list of 4 points [[x1,y1],...]
-                            xs = [int(p[0]) for p in bbox]
-                            ys = [int(p[1]) for p in bbox]
-                            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                            blocks.append({"text": t, "bbox": [x1, y1, x2, y2], "confidence": float(conf)})
-                            if t:
-                                text += (t + "\n")
-                    except Exception as e:
-                        print("[ModelServer] easyocr failed:", e)
-                        text, blocks = _pytesseract_ocr(pil)
-                else:
-                    text, blocks = _pytesseract_ocr(pil)
-                return self._send(200, {"text": text.strip(), "blocks": blocks})
+                text, blocks = ocr_blocks_from_image(pil)
+                layout = summarize_ocr_layout(pil, blocks)
+                return self._send(200, {"text": text.strip(), "blocks": blocks, "layout": layout})
             except Exception as e:
                 print("[ModelServer] OCR error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "ocr_focus":
+            # Build a focus mask from OCR layout (e.g., title or axes) and blur background
+            try:
+                image_path = ensure_image_path(payload)
+                region = payload.get("region", "title")  # title | x_axis | y_axis | legend
+                blur_strength = int(payload.get("blur_strength", 15))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+                pil = Image.open(image_path).convert("RGB")
+                text, blocks = ocr_blocks_from_image(pil)
+                layout = summarize_ocr_layout(pil, blocks)
+                width, height = pil.size
+                m = np.zeros((height, width), dtype=np.float32)
+                cand = layout.get("candidates", {})
+                if region == "title" and cand.get("title"):
+                    x1, y1, x2, y2 = cand["title"]["bbox"]
+                    m = rect_mask(width, height, x1, y1, x2, y2)
+                elif region == "x_axis":
+                    for b in cand.get("x_axis_ticks", []):
+                        x1, y1, x2, y2 = b["bbox"]
+                        m = np.maximum(m, rect_mask(width, height, x1, y1, x2, y2))
+                elif region == "y_axis":
+                    for b in cand.get("y_axis_ticks", []):
+                        x1, y1, x2, y2 = b["bbox"]
+                        m = np.maximum(m, rect_mask(width, height, x1, y1, x2, y2))
+                elif region == "legend":
+                    for b in cand.get("legend_candidates", []):
+                        x1, y1, x2, y2 = b["bbox"]
+                        m = np.maximum(m, rect_mask(width, height, x1, y1, x2, y2))
+                # If nothing found, keep original image (mask zeros)
+                masked = apply_blur_with_mask(pil, m, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "layout": layout, "region": region})
+            except Exception as e:
+                print("[ModelServer] OCR focus error:", e)
                 return self._send(500, {"error": str(e)})
 
         if endpoint == "detect_all":
