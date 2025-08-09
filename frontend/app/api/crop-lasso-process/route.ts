@@ -224,7 +224,7 @@ If you cannot see the image clearly or if the image appears to be corrupted, ple
 
 export async function POST(req: NextRequest) {
   try {
-    const { imageData, userQuery, toolType, coordinates } = await req.json()
+    const { imageData, userQuery, toolType, coordinates, skipAnswer } = await req.json()
 
     if (!imageData || !userQuery || !toolType || !coordinates) {
       return NextResponse.json({ 
@@ -240,29 +240,33 @@ export async function POST(req: NextRequest) {
 
     console.log(`Starting ${toolType} processing...`)
 
-    // Step 1: Generate image caption
-    const imageCaption = await generateImageCaption(imageData)
-    console.log("Image caption:", imageCaption)
+    // Step 1: Generate image caption (unless explicitly skipped)
+    const imageCaption = skipAnswer ? "" : await generateImageCaption(imageData)
+    if (!skipAnswer) console.log("Image caption:", imageCaption)
 
     // Step 2: Create masked image based on user selection
     console.log("Creating masked image...")
     const maskedImageData = await createMaskedImage(imageData, toolType, coordinates)
     console.log("Masked image created successfully")
 
-    // Step 3: Get final answer from GPT-4V
-    console.log("Getting final answer...")
-    const answer = await getFinalAnswer(maskedImageData, userQuery, imageCaption, toolType)
-    console.log("Answer generated:", answer.substring(0, 100) + "...")
-
+    if (!skipAnswer) {
+      // Step 3: Get final answer from GPT-4V
+      console.log("Getting final answer...")
+      const answer = await getFinalAnswer(maskedImageData, userQuery, imageCaption, toolType)
+      console.log("Answer generated:", answer.substring(0, 100) + "...")
+      return NextResponse.json({
+        processedImageData: maskedImageData,
+        refinedQuery: `User selected ${toolType} region`,
+        processingType: toolType,
+        parameters: { coordinates, toolType },
+        answer,
+      })
+    }
     return NextResponse.json({
       processedImageData: maskedImageData,
       refinedQuery: `User selected ${toolType} region`,
       processingType: toolType,
-      parameters: {
-        coordinates: coordinates,
-        toolType: toolType
-      },
-      answer
+      parameters: { coordinates, toolType },
     })
 
   } catch (error) {

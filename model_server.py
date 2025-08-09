@@ -37,6 +37,29 @@ import torch
 DETECTOR = GroundedSAMDetector()
 print("[ModelServer] GroundedSAMDetector loaded")
 
+# Try to initialize OCR backends lazily when used
+_EASYOCR_READER = None
+def _ensure_easyocr():
+    global _EASYOCR_READER
+    if _EASYOCR_READER is None:
+        try:
+            import easyocr  # type: ignore
+            _EASYOCR_READER = easyocr.Reader(["en"])  # add languages as needed
+            print("[ModelServer] easyocr initialized")
+        except Exception as e:
+            print("[ModelServer] easyocr unavailable:", e)
+            _EASYOCR_READER = False
+    return _EASYOCR_READER
+
+def _pytesseract_ocr(pil_img: Image.Image):
+    try:
+        import pytesseract  # type: ignore
+        text = pytesseract.image_to_string(pil_img)
+        return text, []
+    except Exception as e:
+        print("[ModelServer] pytesseract unavailable:", e)
+        return "", []
+
 def np_to_jpeg_base64(img: Image.Image) -> str:
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=90)
@@ -236,6 +259,38 @@ class Handler(BaseHTTPRequestHandler):
             b64 = np_to_jpeg_base64(masked_image)
             print("[ModelServer] Attention inference done", {"saved": out_path})
             return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
+
+        if endpoint == "ocr":
+            try:
+                image_path = ensure_image_path(payload)
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+                pil = Image.open(image_path).convert("RGB")
+                # Try easyocr first
+                reader = _ensure_easyocr()
+                text = ""
+                blocks = []
+                if reader and reader is not False:
+                    try:
+                        results = reader.readtext(np.array(pil))
+                        # results: list of (bbox, text, confidence)
+                        for (bbox, t, conf) in results:
+                            # bbox is list of 4 points [[x1,y1],...]
+                            xs = [int(p[0]) for p in bbox]
+                            ys = [int(p[1]) for p in bbox]
+                            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                            blocks.append({"text": t, "bbox": [x1, y1, x2, y2], "confidence": float(conf)})
+                            if t:
+                                text += (t + "\n")
+                    except Exception as e:
+                        print("[ModelServer] easyocr failed:", e)
+                        text, blocks = _pytesseract_ocr(pil)
+                else:
+                    text, blocks = _pytesseract_ocr(pil)
+                return self._send(200, {"text": text.strip(), "blocks": blocks})
+            except Exception as e:
+                print("[ModelServer] OCR error:", e)
+                return self._send(500, {"error": str(e)})
 
         if endpoint == "detect_all":
             image_path = ensure_image_path(payload)

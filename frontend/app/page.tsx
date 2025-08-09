@@ -12,8 +12,19 @@ import { Separator } from "@/components/ui/separator"
 import { Crop, Lasso, MousePointer, Upload, Send, Bot, User, ChevronLeft, ChevronRight, Eraser } from "lucide-react"
 
 type Tool = "crop" | "lasso" | "object-selector"
-type ProcessingMode = "Original" | "Auto" | "Attention" | "Segmentation" | "Injection"
-type AIModel = "GPT" | "Claude" | "Gemini" | "LLaVA" | "Qwen"
+type Mode = "Ask" | "Edit"
+type ProcessingMode = "Original" | "BlurLight" | "BlurDeep" | "Injection"
+type AIModel =
+  | "GPT"
+  | "Claude"
+  | "Gemini"
+  | "LLaVA"
+  | "Qwen"
+  | "Auto"
+  | "OpenAIImages"
+  | "SDXL"
+  | "StabilityAI"
+  | "LaMa"
 
 interface Selection {
   type: Tool
@@ -28,6 +39,7 @@ interface Message {
 }
 
 export default function AIImageAnalyzer() {
+  const [mode, setMode] = useState<Mode>("Ask")
   const [selectedTool, setSelectedTool] = useState<Tool>("crop")
   const [processingMode, setProcessingMode] = useState<ProcessingMode>("Original")
   const [aiModel, setAIModel] = useState<AIModel>("GPT")
@@ -101,9 +113,9 @@ export default function AIImageAnalyzer() {
         }
       }
 
-      // 1) Draw blurred copy if any selection exists OR if object-selector is active (pre-blur UX)
-      const shouldPreBlur = selectedTool === "object-selector"
-      if (paths.length > 0 || shouldPreBlur) {
+      // 1) Draw blurred copy only if there is a selection to highlight
+      const shouldBlur = paths.length > 0
+      if (shouldBlur) {
         ctx.save()
         ctx.filter = "blur(8px)"
         ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height)
@@ -182,39 +194,49 @@ export default function AIImageAnalyzer() {
     setIsLoading(true)
 
     try {
-      // First, process the image if processing is requested (not Original or Injection)
-      if (processingMode !== "Original" && processingMode !== "Injection") {
+      // First, process the image if processing is requested in Ask mode (not Original or Injection)
+      if (mode === "Ask" && processingMode !== "Original" && processingMode !== "Injection") {
         try {
-          let endpoint = ""
+          // Use agentic orchestrator for Blur modes
+          let endpoint = "/api/ask-agent"
+          const roiSelections = selections.filter((s) => s.type === "crop" || s.type === "lasso")
+          const lastSelection = roiSelections.length > 0 ? roiSelections[roiSelections.length - 1] : null
+          let seedImageData: string | null = null
+          if (lastSelection) {
+            // Create a quick masked seed via existing API (without using its answer)
+            try {
+              const seedResp = await fetch("/api/crop-lasso-process", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  imageData: uploadedImage,
+                  userQuery: input,
+                  toolType: lastSelection.type,
+                  coordinates: lastSelection.coordinates,
+                  skipAnswer: true,
+                }),
+              })
+              if (seedResp.ok) {
+                const seedJson = await seedResp.json()
+                seedImageData = seedJson.processedImageData || null
+              }
+            } catch (e) {
+              // ignore seed errors; agent can still proceed
+            }
+          }
           let requestBody: any = {
             imageData: uploadedImage,
             userQuery: input,
+            mode: processingMode === "BlurDeep" ? "BlurDeep" : "BlurLight",
+            aiModel,
+            selection: lastSelection
+              ? { type: lastSelection.type, coordinates: lastSelection.coordinates }
+              : null,
+            seedImageData,
           }
 
-          // Check if any crop or lasso selection exists; use the most recent one for processing
-          const roiSelections = selections.filter((s) => s.type === "crop" || s.type === "lasso")
-          const lastSelection = roiSelections.length > 0 ? roiSelections[roiSelections.length - 1] : null
-          if (lastSelection) {
-            endpoint = "/api/crop-lasso-process"
-            requestBody = {
-              imageData: uploadedImage,
-              userQuery: input,
-              toolType: lastSelection.type,
-              coordinates: lastSelection.coordinates,
-            }
-          } else {
-            switch (processingMode) {
-              case "Auto":
-                endpoint = "/api/auto-process"
-                break
-              case "Attention":
-                endpoint = "/api/attention-process"
-                break
-              case "Segmentation":
-                endpoint = "/api/segmentation-process"
-                break
-            }
-          }
+          // If lastSelection exists, we can create a quick masked seed preview on the client canvas as a seed for the agent
+          // but for now we just pass selection metadata. The agent will handle ROI-aware planning.
 
           if (endpoint) {
             const processResponse = await fetch(endpoint, {
@@ -228,7 +250,8 @@ export default function AIImageAnalyzer() {
             if (processResponse.ok) {
               const processResult = await processResponse.json()
               console.log("Processing result:", processResult)
-              setProcessedImage(processResult.processedImageData)
+              const finalImg = processResult?.final?.processedImageData || processResult.processedImageData
+              if (finalImg) setProcessedImage(finalImg)
               
               // If the processing API returned an answer, use it directly
               if (processResult.answer) {
@@ -255,8 +278,12 @@ export default function AIImageAnalyzer() {
           setProcessedImage(null)
         }
       } else {
-        // For Original mode (or Injection), ensure we send the original image to chat
+        // For Original/Injection, or in Edit mode, ensure we send the original image to chat
         setProcessedImage(null)
+        // Also clear any overlays to prevent perceived blur over the original
+        const canvas = canvasRef.current
+        const ctx = canvas?.getContext("2d")
+        if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
       }
 
       console.log("Calling chat API (processedImage present?):", !!processedImage)
@@ -533,6 +560,21 @@ export default function AIImageAnalyzer() {
     fetch("/api/warmup", { method: "POST" }).catch(() => {})
   }, [])
 
+  // Ensure model selection is valid when switching modes
+  useEffect(() => {
+    const askModels: AIModel[] = ["GPT", "Claude", "Gemini", "LLaVA", "Qwen", "Auto"]
+    const editModels: AIModel[] = ["OpenAIImages", "SDXL", "StabilityAI", "LaMa"]
+    if (mode === "Ask") {
+      if (!askModels.includes(aiModel)) {
+        setAIModel("GPT")
+      }
+    } else {
+      if (!editModels.includes(aiModel)) {
+        setAIModel("OpenAIImages")
+      }
+    }
+  }, [mode])
+
   // When an image is uploaded, detect all objects and cache them
   useEffect(() => {
     const detect = async () => {
@@ -619,13 +661,14 @@ export default function AIImageAnalyzer() {
                   size="sm"
                   onClick={() => {
                     setSelections([])
+                    setSelectedObjectIds([])
+                    setSelectedObjectPoints([])
                     setDrawPath([])
                     const canvas = canvasRef.current
                     const ctx = canvas?.getContext("2d")
                     if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
-                    if (processedImage && processedImage !== uploadedImage) {
-                      setProcessedImage(uploadedImage)
-                    }
+                    // ensure original image is shown (exact uploaded quality)
+                    setProcessedImage(null)
                   }}
                 >
                   <Eraser className="w-4 h-4 mr-2" />
@@ -640,12 +683,7 @@ export default function AIImageAnalyzer() {
 
         {/* Image Display Area */}
         <div className="flex-1 flex items-center justify-center p-8 relative">
-          {/* Detect-all progress bar */}
-          {isDetectingObjects && (
-            <div className="absolute bottom-2 left-1/2 -translate-x-1/2 w-[60%] h-1.5 bg-gray-200 rounded overflow-hidden shadow">
-              <div className="h-full bg-blue-500 animate-pulse" style={{ width: "60%" }} />
-            </div>
-          )}
+          {/* Detect-all progress bar removed per request */}
           {uploadedImage ? (
             <div className="relative max-w-full max-h-full">
               <img
@@ -736,35 +774,64 @@ export default function AIImageAnalyzer() {
           <div className="flex-1 flex flex-col p-4 space-y-4">
             {/* Model Configuration */}
             <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3">
+              <div className={`grid ${mode === "Ask" ? "grid-cols-3" : "grid-cols-2"} gap-3`}>
+                {/* Mode */}
                 <div className="space-y-1">
-                  <Label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Processing</Label>
-                  <Select value={processingMode} onValueChange={(value: ProcessingMode) => setProcessingMode(value)}>
-                    <SelectTrigger className="h-9 text-sm">
+                  <Label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Mode</Label>
+                  <Select value={mode} onValueChange={(value: Mode) => setMode(value)}>
+                    <SelectTrigger className="h-9 text-sm w-full">
                       <SelectValue />
                     </SelectTrigger>
-                     <SelectContent>
-                       <SelectItem value="Original">Original Image</SelectItem>
-                       <SelectItem value="Auto">Auto</SelectItem>
-                      <SelectItem value="Attention">Attention</SelectItem>
-                      <SelectItem value="Segmentation">Segmentation</SelectItem>
-                      <SelectItem value="Injection">Injection</SelectItem>
+                    <SelectContent>
+                      <SelectItem value="Ask">Ask</SelectItem>
+                      <SelectItem value="Edit">Edit</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
 
+                {/* Processing (Ask mode only) */}
+                {mode === "Ask" && (
+                  <div className="space-y-1">
+                    <Label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Processing</Label>
+                    <Select value={processingMode} onValueChange={(value: ProcessingMode) => setProcessingMode(value)}>
+                      <SelectTrigger className="h-9 text-sm w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                       <SelectContent align="end">
+                         <SelectItem value="Original">Original Image</SelectItem>
+                         <SelectItem value="BlurLight">Blur - Light</SelectItem>
+                         <SelectItem value="BlurDeep">Blur - Deep</SelectItem>
+                         <SelectItem value="Injection">Injection</SelectItem>
+                       </SelectContent>
+                  </Select>
+                  </div>
+                )}
+
+                {/* Model (Ask or Edit) */}
                 <div className="space-y-1">
                   <Label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Model</Label>
                   <Select value={aiModel} onValueChange={(value: AIModel) => setAIModel(value)}>
-                    <SelectTrigger className="h-9 text-sm">
+                    <SelectTrigger className="h-9 text-sm w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="GPT">GPT-4</SelectItem>
-                      <SelectItem value="Claude">Claude</SelectItem>
-                      <SelectItem value="Gemini">Gemini</SelectItem>
-                      <SelectItem value="LLaVA">LLaVA</SelectItem>
-                      <SelectItem value="Qwen">Qwen</SelectItem>
+                      {mode === "Ask" ? (
+                        <>
+                          <SelectItem value="GPT">GPT-4</SelectItem>
+                          <SelectItem value="Claude">Claude</SelectItem>
+                          <SelectItem value="Gemini">Gemini</SelectItem>
+                          <SelectItem value="LLaVA">LLaVA</SelectItem>
+                          <SelectItem value="Qwen">Qwen</SelectItem>
+                          <SelectItem value="Auto">Auto</SelectItem>
+                        </>
+                      ) : (
+                        <>
+                          <SelectItem value="OpenAIImages">OpenAI Images</SelectItem>
+                          <SelectItem value="SDXL">SDXL</SelectItem>
+                          <SelectItem value="StabilityAI">Stability AI</SelectItem>
+                          <SelectItem value="LaMa">LaMa</SelectItem>
+                        </>
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
