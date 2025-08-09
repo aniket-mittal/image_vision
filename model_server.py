@@ -127,19 +127,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": f"invalid json: {e}", "raw": data[:200]})
 
         if endpoint == "attention":
+            image_path = ensure_image_path(payload)
+            query = payload.get("query", "")
+            layer_index = int(payload.get("layer_index", 22))
+            enhancement_control = float(payload.get("enhancement_control", 5.0))
+            smoothing_kernel = int(payload.get("smoothing_kernel", 3))
+            grayscale_level = int(payload.get("grayscale_level", 100))
+            overlay_strength = float(payload.get("overlay_strength", 1.0))
+            output_dir = payload.get("output_dir", "temp_output")
+
+            if not image_path or not os.path.exists(image_path):
+                return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+
+            masked_image = None
             try:
-                image_path = ensure_image_path(payload)
-                query = payload.get("query", "")
-                layer_index = int(payload.get("layer_index", 22))
-                enhancement_control = float(payload.get("enhancement_control", 5.0))
-                smoothing_kernel = int(payload.get("smoothing_kernel", 3))
-                grayscale_level = int(payload.get("grayscale_level", 100))
-                overlay_strength = float(payload.get("overlay_strength", 1.0))
-                output_dir = payload.get("output_dir", "temp_output")
-
-                if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
-
                 # Update model if requested layer index changed
                 global CLIP_GEN
                 if CLIP_GEN.layer_index != layer_index:
@@ -148,48 +149,48 @@ class Handler(BaseHTTPRequestHandler):
                     CLIP_GEN = _CMG(model_name=CLIP_GEN.model_name, layer_index=layer_index, device=CLIP_GEN.device)
 
                 print("[ModelServer] Attention inference start", {"query": query, "layer_index": layer_index})
-                masked_image = None
-                try:
-                    images, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
-                    if attention_maps and token_maps:
-                        pil_image = Image.open(image_path).convert("RGB")
-                        masked_image, _ = CLIP_GEN.create_masked_image(
-                            pil_image,
-                            attention_maps[0],
-                            token_maps[0],
-                            grayscale_level=grayscale_level,
-                            overlay_strength=overlay_strength,
-                        )
-                except Exception as inner_e:
-                    print("[ModelServer] CLIP_GEN path failed; will try fallback", inner_e)
+                images, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
+                if attention_maps and token_maps:
+                    pil_image = Image.open(image_path).convert("RGB")
+                    masked_image, _ = CLIP_GEN.create_masked_image(
+                        pil_image,
+                        attention_maps[0],
+                        token_maps[0],
+                        grayscale_level=grayscale_level,
+                        overlay_strength=overlay_strength,
+                    )
+            except Exception as inner_e:
+                # If CLIP path fails (e.g., torchvision C++ ops issues), log and fallback to SAM
+                print("[ModelServer] CLIP path failed; using GroundedSAM fallback:", inner_e)
 
-                # Fallback to GroundedSAM if CLIP attention fails
-                if masked_image is None:
+            # Fallback to GroundedSAM if CLIP attention fails
+            if masked_image is None:
+                try:
                     print("[ModelServer] Using GroundedSAM fallback for attention")
                     pil = Image.open(image_path).convert("RGB")
                     width, height = pil.size
                     masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query or "object")
-                    if not masks:
+                    if masks:
+                        import numpy as _np
+                        combined = _np.zeros((height, width), dtype=_np.float32)
+                        for m in masks:
+                            if m.ndim == 3 and m.shape[0] == 1:
+                                m = m[0]
+                            combined = _np.maximum(combined, m)
+                        masked_image = apply_blur_with_mask(pil, combined, blur_strength=15)
+                    else:
                         return self._send(200, {"processedImageData": None, "note": "no objects for fallback"})
-                    import numpy as _np
-                    combined = _np.zeros((height, width), dtype=_np.float32)
-                    for m in masks:
-                        if m.ndim == 3 and m.shape[0] == 1:
-                            m = m[0]
-                        combined = _np.maximum(combined, m)
-                    masked_image = apply_blur_with_mask(pil, combined, blur_strength=15)
+                except Exception as se:
+                    print("[ModelServer] SAM fallback failed:", se)
+                    return self._send(500, {"error": str(se)})
 
-                os.makedirs(output_dir, exist_ok=True)
-                base_name = os.path.splitext(os.path.basename(image_path))[0]
-                out_path = os.path.join(output_dir, f"{base_name}_clip_masked.jpg")
-                masked_image.save(out_path)
-                # Also return base64 data URL for direct consumption
-                b64 = np_to_jpeg_base64(masked_image)
-                print("[ModelServer] Attention inference done", {"saved": out_path})
-                return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
-            except Exception as e:
-                print("[ModelServer] Attention inference error", e)
-                return self._send(500, {"error": str(e)})
+            os.makedirs(output_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            out_path = os.path.join(output_dir, f"{base_name}_clip_masked.jpg")
+            masked_image.save(out_path)
+            b64 = np_to_jpeg_base64(masked_image)
+            print("[ModelServer] Attention inference done", {"saved": out_path})
+            return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
 
         if endpoint == "detect_all":
             try:
