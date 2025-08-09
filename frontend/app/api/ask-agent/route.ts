@@ -23,6 +23,7 @@ interface StepResult {
   refinedQuery: string
   params: any
   rationale?: string
+  narrative?: string
 }
 
 async function callOpenAI(messages: any[], maxTokens = 700) {
@@ -48,7 +49,7 @@ async function runAttention(imagePath: string, query: string, p: any) {
   const r = await fetch(`${MODEL_SERVER_URL}/attention`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
   if (!r.ok) throw new Error(`attention ${r.status}: ${await r.text()}`)
   const data = await r.json()
-  return data as { processedImageData: string; attention_bbox?: number[] }
+  return data.processedImageData as string
 }
 
 async function runSegmentation(imagePath: string, query: string, p: any) {
@@ -66,7 +67,7 @@ async function runSegmentation(imagePath: string, query: string, p: any) {
   if (!r.ok) throw new Error(`segmentation ${r.status}: ${await r.text()}`)
   const data = await r.json()
   if (!data.processedImageData) throw new Error("no processedImageData from segmentation")
-  return data as { processedImageData: string; objects?: Array<{ bbox: number[]; label: string }>; combined_bbox?: number[] }
+  return data as { processedImageData: string; objects?: Array<{ bbox: number[]; label: string }> }
 }
 
 async function runOCR(imagePath: string) {
@@ -164,7 +165,7 @@ export async function POST(req: NextRequest) {
       // Optionally set a neutral plan
       lastTechnique = "attention"
       lastParams = {}
-      steps.push({ processedImageData: seedImageData, technique: lastTechnique, refinedQuery: userQuery, params: {} as any, rationale: "user-seed" })
+      steps.push({ processedImageData: seedImageData, technique: lastTechnique, refinedQuery: userQuery, params: {} as any, rationale: "user-seed", narrative: "Using user-provided region as initial focus." })
     }
 
     for (let i = seedImageData ? 1 : 0; i < iters; i++) {
@@ -222,7 +223,7 @@ export async function POST(req: NextRequest) {
           else if (q.includes("legend")) region = "legend"
           if (region) {
             const of = await runOCRFocus(imagePath, region)
-            steps.push({ processedImageData: of.processedImageData, technique: "segmentation", refinedQuery: `${region} text region`, params: { region } })
+            steps.push({ processedImageData: of.processedImageData, technique: "segmentation", refinedQuery: `${region} text region`, params: { region }, narrative: `Focusing around ${region.replace("_","-")} region detected by OCR.` })
             lastProcessed = of.processedImageData
           }
         } catch {}
@@ -233,12 +234,12 @@ export async function POST(req: NextRequest) {
       if (plan.technique === "segmentation") {
         const seg = await runSegmentation(imagePath, plan.refinedQuery || userQuery, plan.params || {})
         processed = seg.processedImageData
-        // If objects/combined_bbox available, pass hints to verifier prompt implicitly via params
-        if (seg.combined_bbox && !plan.params.bbox_bias) plan.params.bbox_bias = seg.combined_bbox
+        // Feed object bboxes back into the verifier context
+        if (Array.isArray((seg as any).objects) && (seg as any).objects.length) {
+          lastSuggestion = (lastSuggestion ? lastSuggestion + " | " : "") + `objects:${(seg as any).objects.length}`
+        }
       } else {
-        const att = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
-        processed = att.processedImageData
-        if (att.attention_bbox && !plan.params.bbox_bias) plan.params.bbox_bias = att.attention_bbox
+        processed = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
       }
 
       lastProcessed = processed
@@ -250,7 +251,7 @@ export async function POST(req: NextRequest) {
       const verifierUser = {
         role: "user",
         content: [
-          { type: "text", text: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nCurrent technique: ${plan.technique}\nRefined query: ${plan.refinedQuery}\nParams: ${JSON.stringify(plan.params)}\nReturn JSON: {"score":0-1,"good":true|false,"suggestion":"..."}` },
+          { type: "text", text: `Question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nCurrent technique: ${plan.technique}\nRefined query: ${plan.refinedQuery}\nParams: ${JSON.stringify(plan.params)}${lastSuggestion ? "\nNotes: "+lastSuggestion : ""}\nReturn JSON: {"score":0-1,"good":true|false,"suggestion":"..."}` },
           { type: "image_url", image_url: { url: processed } },
         ],
       }
@@ -265,7 +266,24 @@ export async function POST(req: NextRequest) {
       }
       lastSuggestion = verdict.suggestion || null
 
-      steps.push({ processedImageData: processed, technique: plan.technique, refinedQuery: plan.refinedQuery, params: plan.params, rationale: plan.rationale })
+      // Generate a compact natural language narrative for this step
+      let narrative = ""
+      try {
+        const narrSys = { role: "system", content: "Write one short sentence (max ~15 words) describing the image action. No punctuation list markers. No quotes." }
+        const keyParams = (() => {
+          const { spatial_bias, mask_type, blur_strength, layer_index } = plan.params || {}
+          const arr = [] as string[]
+          if (spatial_bias) arr.push(`bias:${spatial_bias}`)
+          if (mask_type) arr.push(`mask:${mask_type}`)
+          if (typeof blur_strength !== "undefined") arr.push(`blur:${blur_strength}`)
+          if (typeof layer_index !== "undefined") arr.push(`layer:${layer_index}`)
+          return arr.join(", ")
+        })()
+        const narrUser = { role: "user", content: `Technique: ${plan.technique}\nTarget: ${plan.refinedQuery}\nParams: ${keyParams || "-"}\nOCR hint: ${ocrSummary}` }
+        const narr = await callOpenAI([narrSys, narrUser], 60)
+        narrative = (narr.choices?.[0]?.message?.content || "").trim()
+      } catch {}
+      steps.push({ processedImageData: processed, technique: plan.technique, refinedQuery: plan.refinedQuery, params: plan.params, rationale: plan.rationale, narrative })
 
       if (verdict.score > bestScore) {
         bestScore = verdict.score
@@ -324,7 +342,7 @@ export async function POST(req: NextRequest) {
       try {
         if (sqPlan.technique === "segmentation") sqImage = await runSegmentation(imagePath, sqPlan.refinedQuery, sqPlan.params)
         else sqImage = await runAttention(imagePath, sqPlan.refinedQuery, sqPlan.params)
-        steps.push({ processedImageData: sqImage, technique: sqPlan.technique, refinedQuery: sqPlan.refinedQuery, params: sqPlan.params, rationale: `subq: ${sq}` })
+        steps.push({ processedImageData: sqImage, technique: sqPlan.technique, refinedQuery: sqPlan.refinedQuery, params: sqPlan.params, rationale: `subq: ${sq}`, narrative: `Investigating sub-question using ${sqPlan.technique}.` })
       } catch {}
       // Optional: a brief internal finding
       if (sqImage) {

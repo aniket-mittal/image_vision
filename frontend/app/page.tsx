@@ -262,6 +262,7 @@ export default function AIImageAnalyzer() {
                   if (s.params) parts.push(`params=${JSON.stringify(s.params)}`)
                   if (s.rationale) parts.push(`note=${s.rationale}`)
                   logs.push(parts.join(" | "))
+                  if (s.narrative) logs.push(s.narrative)
                 })
                 setAgentEvents((prev) => [...prev, ...logs])
               }
@@ -354,10 +355,6 @@ export default function AIImageAnalyzer() {
                 setMessages((prev) =>
                   prev.map((msg) => (msg.id === assistantMessageId ? { ...msg, content: assistantMessage } : msg)),
                 )
-              }
-              // Lightweight inline agent updates (if backend starts streaming such events, we can handle here)
-              if (data.agentEvent) {
-                setAgentEvents((prev) => [...prev, String(data.agentEvent)])
               }
             } catch (e) {
               // Ignore parsing errors
@@ -894,7 +891,6 @@ export default function AIImageAnalyzer() {
                   </div>
                 )}
 
-                <div className="max-h-[55vh] overflow-y-auto pr-1">
                 {messages.map((message) => (
                   <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
                     <div
@@ -923,7 +919,6 @@ export default function AIImageAnalyzer() {
                     </div>
                   </div>
                 ))}
-                </div>
 
                 {isLoading && (
                   <div className="flex justify-start">
