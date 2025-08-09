@@ -127,7 +127,7 @@ export async function POST(req: NextRequest) {
 
         for (let i = seedImageData ? 1 : 0; i < iters; i++) {
           // Plan
-          const sysPlanner = { role: "system", content: "You are a vision planning agent. Return strict JSON with {\"technique\":\"attention|segmentation\",\"refinedQuery\":\"...\",\"params\":{...}}." }
+          const sysPlanner = { role: "system", content: "You are a vision planning agent. Return strict JSON with {\"technique\":\"attention|segmentation\",\"refinedQuery\":\"...\",\"params\":{...}}. Important: The segmentation model is object-centric and cannot reliably detect or delineate thin primitives like lines, borders, grids, arrows, or simple geometric strokes. For line-like features or chart axes, prefer attention (and/or OCR focus) or draw your own blur masks from coordinates (box/oval)." }
           const plannerUser = { role: "user", content: `Question: ${userQuery}\nOCR: ${ocr?.text || "<none>"}\nOCR Layout: ${ocrSummary}\nPrevious technique: ${lastTechnique || "<none>"}\nPrevious params: ${JSON.stringify(lastParams)}\nVerifier suggestion: ${lastSuggestion || "<none>"}\nUser ROI: ${selection ? JSON.stringify(selection) : "<none>"}` }
           let plan: any = { technique: "attention", refinedQuery: userQuery, params: {} }
           try {
@@ -137,6 +137,11 @@ export async function POST(req: NextRequest) {
           } catch {}
           const rq = (plan.refinedQuery || "").toLowerCase()
           plan.params = plan.params || {}
+          // Heuristic: avoid segmentation for line-like requests
+          const liney = /\b(line|lines|border|edge|grid|gridline|axis line|underline|arrow|curve|outline|frame|square|rectangle)\b/i
+          if (plan.technique === "segmentation" && (liney.test(rq) || liney.test(userQuery))) {
+            plan.technique = "attention"
+          }
           if (!plan.params.spatial_bias) {
             if (rq.includes("left")) plan.params.spatial_bias = "left"
             else if (rq.includes("right")) plan.params.spatial_bias = "right"
@@ -184,7 +189,11 @@ export async function POST(req: NextRequest) {
           } else {
             const attn = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
             processed = attn.processedImageData
-            if (attn.attention_bbox) send({ type: "coords", step: i + 1, attention_bbox: attn.attention_bbox })
+            if (Array.isArray((attn as any).attention_regions)) {
+              send({ type: "coords", step: i + 1, attention_regions: (attn as any).attention_regions })
+            } else if ((attn as any).attention_bbox) {
+              send({ type: "coords", step: i + 1, attention_bbox: (attn as any).attention_bbox })
+            }
           }
           lastProcessed = processed
           lastTechnique = plan.technique

@@ -415,25 +415,56 @@ class Handler(BaseHTTPRequestHandler):
                     grayscale_level=grayscale_level,
                     overlay_strength=overlay_strength,
                 )
-                # Compute coarse bbox from attention map (threshold at 0.5 after normalization)
+                # Compute multi-region attention proposals (robust against noise)
                 try:
+                    import cv2
                     amh, amw = am.shape[-2], am.shape[-1]
                     am_np = am.detach().cpu().numpy() if torch.is_tensor(am) else np.array(am)
                     am_np = (am_np - am_np.min()) / (am_np.max() - am_np.min() + 1e-6)
-                    thr = (am_np >= 0.5).astype(np.uint8)
-                    ys, xs = np.where(thr > 0)
-                    if ys.size > 0 and xs.size > 0:
-                        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                        # scale to image size
-                        W, H = pil_image.size
-                        x1 = int(x1 / amw * W); x2 = int(x2 / amw * W)
-                        y1 = int(y1 / amh * H); y2 = int(y2 / amh * H)
-                        attention_bbox = [x1, y1, x2, y2]
+                    # Upscale to image size for precise geometry
+                    W, H = pil_image.size
+                    am_up = cv2.resize(am_np.astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
+                    # Percentile thresholding for saliency
+                    p = np.percentile(am_up, 85.0)
+                    binm = (am_up >= max(0.0, min(1.0, p))).astype(np.uint8)
+                    # Find contours and build regions
+                    contours, _ = cv2.findContours(binm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    regions = []
+                    min_area = max(1, int(0.005 * W * H))
+                    for cnt in contours:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        area = int(w * h)
+                        if area < min_area:
+                            continue
+                        # polygon (simplified for readability)
+                        eps = 0.01 * cv2.arcLength(cnt, True)
+                        poly = cv2.approxPolyDP(cnt, eps, True)
+                        poly_pts = [[int(pt[0][0]), int(pt[0][1])] for pt in poly]
+                        # region mean score
+                        mask_r = np.zeros((H, W), dtype=np.uint8)
+                        cv2.drawContours(mask_r, [cnt], -1, 1, thickness=-1)
+                        sel = am_up[mask_r.astype(bool)]
+                        mean_score = float(sel.mean()) if sel.size > 0 else 0.0
+                        regions.append({
+                            "bbox": [int(x), int(y), int(x + w - 1), int(y + h - 1)],
+                            "polygon": poly_pts,
+                            "mean": mean_score,
+                            "area_fraction": float(area) / float(W * H),
+                        })
+                    # Sort by combined saliency (mean * area) and clip top-5
+                    regions = sorted(regions, key=lambda r: r["mean"] * max(1e-6, r["area_fraction"]), reverse=True)[:5]
+                    # Legacy single bbox: union of top region or fallback to whole image
+                    if regions:
+                        xs = [r["bbox"][0] for r in regions] + [r["bbox"][2] for r in regions]
+                        ys = [r["bbox"][1] for r in regions] + [r["bbox"][3] for r in regions]
+                        attention_bbox = [min(xs), min(ys), max(xs), max(ys)]
                     else:
-                        attention_bbox = [0, 0, pil_image.size[0], pil_image.size[1]]
+                        attention_bbox = [0, 0, W - 1, H - 1]
+                    attention_regions = regions
                 except Exception as _e:
-                    print("[ModelServer] attention bbox compute failed:", _e)
-                    attention_bbox = [0, 0, pil_image.size[0], pil_image.size[1]]
+                    print("[ModelServer] attention regions compute failed:", _e)
+                    attention_bbox = [0, 0, pil_image.size[0] - 1, pil_image.size[1] - 1]
+                    attention_regions = []
             except Exception as inner_e:
                 # If CLIP path fails (e.g., torchvision C++ ops issues), log and fallback to SAM
                 print("[ModelServer] CLIP path failed; using GroundedSAM fallback:", inner_e)
@@ -466,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
             masked_image.save(out_path)
             b64 = np_to_jpeg_base64(masked_image)
             print("[ModelServer] Attention inference done", {"saved": out_path})
-            return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}", "attention_bbox": locals().get("attention_bbox")})
+            return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}", "attention_bbox": locals().get("attention_bbox"), "attention_regions": locals().get("attention_regions")})
 
         if endpoint == "ocr":
             try:
