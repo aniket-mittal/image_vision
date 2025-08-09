@@ -261,8 +261,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def run():
     port = int(os.environ.get("MODEL_SERVER_PORT", "8765"))
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    print(f"[ModelServer] Listening on 127.0.0.1:{port}")
+    host = os.environ.get("MODEL_SERVER_HOST", "127.0.0.1")
+    server = HTTPServer((host, port), Handler)
+    print(f"[ModelServer] Listening on {host}:{port}")
     server.serve_forever()
 
 
