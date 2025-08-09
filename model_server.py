@@ -171,16 +171,18 @@ class Handler(BaseHTTPRequestHandler):
                     CLIP_GEN = _CMG(model_name=CLIP_GEN.model_name, layer_index=layer_index, device=CLIP_GEN.device)
 
                 print("[ModelServer] Attention inference start", {"query": query, "layer_index": layer_index})
-                images, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
-                if attention_maps and token_maps:
-                    pil_image = Image.open(image_path).convert("RGB")
-                    masked_image, _ = CLIP_GEN.create_masked_image(
-                        pil_image,
-                        attention_maps[0],
-                        token_maps[0],
-                        grayscale_level=grayscale_level,
-                        overlay_strength=overlay_strength,
-                    )
+                _imgs, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
+                # Normalize to tensors (not truth-tested directly to avoid PyTorch ambiguity)
+                am = attention_maps[0] if isinstance(attention_maps, (list, tuple)) else attention_maps
+                tm = token_maps[0] if isinstance(token_maps, (list, tuple)) else token_maps
+                pil_image = Image.open(image_path).convert("RGB")
+                masked_image, _ = CLIP_GEN.create_masked_image(
+                    pil_image,
+                    am,
+                    tm,
+                    grayscale_level=grayscale_level,
+                    overlay_strength=overlay_strength,
+                )
             except Exception as inner_e:
                 # If CLIP path fails (e.g., torchvision C++ ops issues), log and fallback to SAM
                 print("[ModelServer] CLIP path failed; using GroundedSAM fallback:", inner_e)
