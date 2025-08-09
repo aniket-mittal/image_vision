@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os
+import base64
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -11,6 +13,44 @@ from PIL import Image
 
 CLIP_GEN = CLIPMaskGenerator(model_name="ViT-L-14-336", layer_index=22, device=None)
 print("[ModelServer] CLIP model loaded")
+
+# Load Grounded SAM once (GroundingDINO + SAM)
+print("[ModelServer] Loading GroundedSAMDetector...")
+from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
+import numpy as np
+
+DETECTOR = GroundedSAMDetector()
+print("[ModelServer] GroundedSAMDetector loaded")
+
+def np_to_jpeg_base64(img: Image.Image) -> str:
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def apply_blur_with_mask(image: Image.Image, mask: np.ndarray, blur_strength: int = 15) -> Image.Image:
+    import cv2
+    image_np = np.array(image).astype(np.float32)
+    h, w = image_np.shape[:2]
+    if blur_strength % 2 == 0:
+        blur_strength += 1
+    if mask.ndim == 3:
+        if mask.shape[0] == 1:
+            mask = mask[0]
+        else:
+            mask = mask[:, :, 0]
+    mask = np.clip(mask, 0, 1)
+    if mask.shape != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    blurred = cv2.GaussianBlur(image_np, (blur_strength, blur_strength), 0)
+    mask3 = np.stack([mask] * 3, axis=-1)
+    out = image_np * mask3 + blurred * (1.0 - mask3)
+    return Image.fromarray(out.astype(np.uint8))
+
+def mask_bbox(mask: np.ndarray):
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0 or xs.size == 0:
+        return [0, 0, int(mask.shape[1]), int(mask.shape[0])]
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -103,6 +143,106 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"saved": out_path})
             except Exception as e:
                 print("[ModelServer] Attention inference error", e)
+                return self._send(500, {"error": str(e)})
+
+        if parsed.path == "/detect_all":
+            try:
+                image_path = payload.get("image_path")
+                prompt = payload.get("prompt", "object")
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                width, height = pil.size
+                print("[ModelServer] Detect_all start", {"prompt": prompt})
+                masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
+                objects = []
+                for idx, box in enumerate(boxes):
+                    cx, cy, w_norm, h_norm = box
+                    x1 = max(0, int((cx - w_norm / 2) * width))
+                    y1 = max(0, int((cy - h_norm / 2) * height))
+                    x2 = min(width, int((cx + w_norm / 2) * width))
+                    y2 = min(height, int((cy + h_norm / 2) * height))
+                    label = phrases[idx] if idx < len(phrases) else "object"
+                    objects.append({"id": idx, "bbox": [x1, y1, x2, y2], "label": label})
+                print("[ModelServer] Detect_all done", {"count": len(objects)})
+                return self._send(200, {"image": {"width": width, "height": height}, "objects": objects})
+            except Exception as e:
+                print("[ModelServer] Detect_all error", e)
+                return self._send(500, {"error": str(e)})
+
+        if parsed.path == "/sam_click":
+            try:
+                image_path = payload.get("image_path")
+                x = int(payload.get("x", 0))
+                y = int(payload.get("y", 0))
+                blur_strength = int(payload.get("blur_strength", 15))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                image_np = np.array(pil)
+                DETECTOR.sam_predictor.set_image(image_np)
+                masks, _, _ = DETECTOR.sam_predictor.predict(
+                    point_coords=np.array([[x, y]]),
+                    point_labels=np.array([1]),
+                    multimask_output=False,
+                )
+                mask = masks.astype(np.float32)
+                if mask.ndim == 3:
+                    mask = mask[0]
+                masked = apply_blur_with_mask(pil, mask, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                bbox = mask_bbox(mask)
+                print("[ModelServer] SAM-click done", {"bbox": bbox})
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": bbox})
+            except Exception as e:
+                print("[ModelServer] SAM-click error", e)
+                return self._send(500, {"error": str(e)})
+
+        if parsed.path == "/segmentation":
+            try:
+                image_path = payload.get("image_path")
+                query = payload.get("query", "object")
+                blur_strength = int(payload.get("blur_strength", 15))
+                padding = int(payload.get("padding", 20))
+                mask_type = payload.get("mask_type", "precise")
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                width, height = pil.size
+                print("[ModelServer] Segmentation start", {"query": query, "mask_type": mask_type})
+                masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query)
+                if not masks:
+                    return self._send(200, {"processedImageData": None, "objects": [], "note": "no objects"})
+                combined = np.zeros((height, width), dtype=np.float32)
+                for m in masks:
+                    if m.ndim == 3 and m.shape[0] == 1:
+                        m = m[0]
+                    combined = np.maximum(combined, m)
+                if mask_type == "oval":
+                    # create oval mask around union bbox with padding
+                    import cv2
+                    ys, xs = np.where(combined > 0)
+                    if ys.size == 0:
+                        mask_final = np.zeros_like(combined)
+                    else:
+                        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+                        x1 = max(0, x1 - padding)
+                        y1 = max(0, y1 - padding)
+                        x2 = min(width - 1, x2 + padding)
+                        y2 = min(height - 1, y2 + padding)
+                        center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                        axes = (max(1, int((x2 - x1) / 2)), max(1, int((y2 - y1) / 2)))
+                        mask_final = np.zeros_like(combined, dtype=np.uint8)
+                        cv2.ellipse(mask_final, center, axes, 0, 0, 360, 1, -1)
+                        mask_final = mask_final.astype(np.float32)
+                else:
+                    mask_final = combined
+                masked = apply_blur_with_mask(pil, mask_final, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                print("[ModelServer] Segmentation done")
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] Segmentation error", e)
                 return self._send(500, {"error": str(e)})
 
         return self._send(404, {"error": "not found"})

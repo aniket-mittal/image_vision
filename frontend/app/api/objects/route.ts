@@ -105,6 +105,11 @@ export async function PUT(req: NextRequest) {
       })
       if (!resp.ok) return NextResponse.json({ error: `SAM click failed ${resp.status}` }, { status: 500 })
       const payload = await resp.json()
+      // model server returns processedImageData directly
+      if (payload.processedImageData) {
+        return NextResponse.json({ processedImageData: payload.processedImageData, bbox: payload.bbox })
+      }
+      // backward compat if only path returned
       const abs = payload.saved
       const data = await import("fs/promises").then((fs) => fs.readFile(abs))
       const processedImageData = `data:image/jpeg;base64,${data.toString("base64")}`
