@@ -141,10 +141,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
 
                 # Update model if requested layer index changed
+                global CLIP_GEN
                 if CLIP_GEN.layer_index != layer_index:
                     print(f"[ModelServer] Reinitializing CLIP with layer_index={layer_index}")
                     from generate_attention_masks.clip_api.clip_model import CLIPMaskGenerator as _CMG
-                    global CLIP_GEN
                     CLIP_GEN = _CMG(model_name=CLIP_GEN.model_name, layer_index=layer_index, device=CLIP_GEN.device)
 
                 print("[ModelServer] Attention inference start", {"query": query, "layer_index": layer_index})
