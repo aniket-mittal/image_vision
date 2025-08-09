@@ -121,10 +121,10 @@ class Handler(BaseHTTPRequestHandler):
         endpoint = path.split("/")[-1]
         length = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(length).decode("utf-8")
-            try:
-                payload = json.loads(data) if data else {}
-            except Exception as e:
-                return self._send(400, {"error": f"invalid json: {e}", "raw": data[:200]})
+        try:
+            payload = json.loads(data) if data else {}
+        except Exception as e:
+            return self._send(400, {"error": f"invalid json: {e}", "raw": data[:200]})
 
         if endpoint == "attention":
             try:
