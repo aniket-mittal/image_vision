@@ -48,7 +48,7 @@ async function runAttention(imagePath: string, query: string, p: any) {
   const r = await fetch(`${MODEL_SERVER_URL}/attention`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
   if (!r.ok) throw new Error(`attention ${r.status}: ${await r.text()}`)
   const data = await r.json()
-  return data.processedImageData as string
+  return data as { processedImageData: string; attention_bbox?: number[] }
 }
 
 async function runSegmentation(imagePath: string, query: string, p: any) {
@@ -66,7 +66,7 @@ async function runSegmentation(imagePath: string, query: string, p: any) {
   if (!r.ok) throw new Error(`segmentation ${r.status}: ${await r.text()}`)
   const data = await r.json()
   if (!data.processedImageData) throw new Error("no processedImageData from segmentation")
-  return data.processedImageData as string
+  return data as { processedImageData: string; objects?: Array<{ bbox: number[]; label: string }>; combined_bbox?: number[] }
 }
 
 async function runOCR(imagePath: string) {
@@ -231,9 +231,14 @@ export async function POST(req: NextRequest) {
       // Execute tool call
       let processed: string
       if (plan.technique === "segmentation") {
-        processed = await runSegmentation(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        const seg = await runSegmentation(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        processed = seg.processedImageData
+        // If objects/combined_bbox available, pass hints to verifier prompt implicitly via params
+        if (seg.combined_bbox && !plan.params.bbox_bias) plan.params.bbox_bias = seg.combined_bbox
       } else {
-        processed = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        const att = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        processed = att.processedImageData
+        if (att.attention_bbox && !plan.params.bbox_bias) plan.params.bbox_bias = att.attention_bbox
       }
 
       lastProcessed = processed

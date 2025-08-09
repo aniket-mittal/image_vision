@@ -363,6 +363,19 @@ class Handler(BaseHTTPRequestHandler):
                     grayscale_level=grayscale_level,
                     overlay_strength=overlay_strength,
                 )
+                # Compute a coarse bbox from attention map
+                try:
+                    att = am.detach().cpu().numpy().astype(np.float32)
+                    att = (att - att.min()) / (att.max() - att.min() + 1e-6)
+                    thr = 0.5
+                    mask_att = (att >= thr).astype(np.uint8)
+                    ys, xs = np.where(mask_att > 0)
+                    if ys.size > 0 and xs.size > 0:
+                        att_bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                    else:
+                        att_bbox = [0, 0, pil_image.size[0] - 1, pil_image.size[1] - 1]
+                except Exception:
+                    att_bbox = None
             except Exception as inner_e:
                 # If CLIP path fails (e.g., torchvision C++ ops issues), log and fallback to SAM
                 print("[ModelServer] CLIP path failed; using GroundedSAM fallback:", inner_e)
@@ -395,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
             masked_image.save(out_path)
             b64 = np_to_jpeg_base64(masked_image)
             print("[ModelServer] Attention inference done", {"saved": out_path})
-            return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
+            return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}", "attention_bbox": att_bbox})
 
         if endpoint == "ocr":
             try:
@@ -548,14 +561,24 @@ class Handler(BaseHTTPRequestHandler):
             print("[ModelServer] Segmentation start", {"query": query, "mask_type": mask_type})
 
             combined = None
+            objects = []
             # Try text-prompted detection first
             try:
                 masks, boxes, phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=query)
                 if masks:
                     combined = np.zeros((height, width), dtype=np.float32)
-                    for m in masks:
+                    for idx, m in enumerate(masks):
                         m = ensure_foreground_mask(m)
                         combined = np.maximum(combined, m)
+                    # Convert normalized cx,cy,w,h to pixel bboxes
+                    for idx, box in enumerate(boxes or []):
+                        cx, cy, w_norm, h_norm = box
+                        x1 = max(0, int((cx - w_norm / 2) * width))
+                        y1 = max(0, int((cy - h_norm / 2) * height))
+                        x2 = min(width - 1, int((cx + w_norm / 2) * width))
+                        y2 = min(height - 1, int((cy + h_norm / 2) * height))
+                        label = phrases[idx] if idx < len(phrases) else "object"
+                        objects.append({"bbox": [x1, y1, x2, y2], "label": label})
             except Exception as e:
                 print("[ModelServer] Segmentation GroundedDINO error, will fallback to SAM auto:", e)
 
@@ -565,9 +588,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not objs:
                     return self._send(200, {"processedImageData": None, "objects": [], "note": "no objects"})
                 combined = np.zeros((height, width), dtype=np.float32)
-                for m, _bbox in objs:
+                for m, bbox in objs:
                     m = ensure_foreground_mask(m)
                     combined = np.maximum(combined, m)
+                    objects.append({"bbox": bbox, "label": "object"})
 
             # Build final mask according to mode
             if mask_type == "oval":
@@ -590,9 +614,15 @@ class Handler(BaseHTTPRequestHandler):
                 mask_final = combined
 
             masked = apply_blur_with_mask(pil, mask_final, blur_strength)
+            # Combined bbox for final mask
+            ys, xs = np.where(mask_final > 0)
+            if ys.size > 0 and xs.size > 0:
+                combined_bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+            else:
+                combined_bbox = [0, 0, width - 1, height - 1]
             b64 = np_to_jpeg_base64(masked)
             print("[ModelServer] Segmentation done")
-            return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "objects": objects, "combined_bbox": combined_bbox})
 
         return self._send(404, {"error": "not found"})
 
