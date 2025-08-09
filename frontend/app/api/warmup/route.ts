@@ -23,7 +23,8 @@ async function startModelServer(): Promise<void> {
   const maxAttempts = 20
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const res = await fetch("http://127.0.0.1:8765/health")
+      const base = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
+      const res = await fetch(`${base}/health`)
       if (res.ok) {
         console.log("[Warmup] CLIP model server is healthy")
         modelServerStarting = false

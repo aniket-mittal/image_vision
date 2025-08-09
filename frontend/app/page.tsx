@@ -38,6 +38,7 @@ export default function AIImageAnalyzer() {
   const [selections, setSelections] = useState<Selection[]>([])
   const [isDrawing, setIsDrawing] = useState(false)
   const [drawPath, setDrawPath] = useState<number[]>([])
+  const [isDetectingObjects, setIsDetectingObjects] = useState(false)
 
   // Custom chat state
   const [messages, setMessages] = useState<Message[]>([])
@@ -512,6 +513,7 @@ export default function AIImageAnalyzer() {
     const detect = async () => {
       if (!uploadedImage) return
       try {
+        setIsDetectingObjects(true)
         const res = await fetch("/api/objects", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -531,6 +533,9 @@ export default function AIImageAnalyzer() {
           }
         }
       } catch (_) {}
+      finally {
+        setIsDetectingObjects(false)
+      }
     }
     detect()
   }, [uploadedImage, imageNaturalSize, runSamClickAt])
@@ -612,6 +617,12 @@ export default function AIImageAnalyzer() {
 
         {/* Image Display Area */}
         <div className="flex-1 flex items-center justify-center p-8 relative">
+          {/* Detect-all progress bar */}
+          {isDetectingObjects && (
+            <div className="absolute bottom-2 left-1/2 -translate-x-1/2 w-[60%] h-1.5 bg-gray-200 rounded overflow-hidden shadow">
+              <div className="h-full bg-blue-500 animate-pulse" style={{ width: "60%" }} />
+            </div>
+          )}
           {uploadedImage ? (
             <div className="relative max-w-full max-h-full">
               <img

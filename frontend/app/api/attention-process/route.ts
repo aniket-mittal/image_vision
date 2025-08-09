@@ -162,7 +162,7 @@ Respond in JSON format:
 }
 
 async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string }> {
-  // Call model server for persistent CLIP inference to avoid reloading
+  // Try model server first
   const requestBody = {
     image_path: imagePath,
     query,
@@ -173,17 +173,58 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     overlay_strength: parameters.overlay_strength ?? 1.0,
     output_dir: "temp_output",
   }
-  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
-  const res = await fetch(`${MODEL_SERVER_URL}/attention`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody),
-  })
-  if (!res.ok) {
-    throw new Error(`Model server error ${res.status}: ${await res.text()}`)
+  const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
+  try {
+    const res = await fetch(`${MODEL_SERVER_URL}/attention`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      return { savedPath: data.saved, processedImageData: data.processedImageData }
+    }
+  } catch (_) {
+    // fall through
   }
-  const data = await res.json()
-  return { savedPath: data.saved, processedImageData: data.processedImageData }
+  // Fallback: local python runner
+  return await new Promise((resolve, reject) => {
+    const cwd = "/Users/aniketmittal/Desktop/code/image_vision"
+    const args = [
+      "run_attention_masks.py",
+      imagePath,
+      query,
+      "--layer_index",
+      String(parameters.layer_index ?? 23),
+      "--enhancement_control",
+      String(parameters.enhancement_control ?? 5.0),
+      "--smoothing_kernel",
+      String(parameters.smoothing_kernel ?? 3),
+      "--grayscale_level",
+      String(parameters.grayscale_level ?? 200),
+      "--overlay_strength",
+      String(parameters.overlay_strength ?? 1.0),
+      "--output_dir",
+      "temp_output",
+    ]
+    const py = spawn("conda", ["run", "-n", "clip_api", "python", ...args], { cwd })
+    let out = ""
+    let err = ""
+    py.stdout.on("data", (d) => (out += d.toString()))
+    py.stderr.on("data", (d) => (err += d.toString()))
+    py.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Attention script failed ${code}: ${err}`))
+        return
+      }
+      const match = out.match(/Saved to: (.+\.jpg)/)
+      if (match) {
+        resolve({ savedPath: match[1] })
+      } else {
+        reject(new Error("Could not parse attention output path"))
+      }
+    })
+  })
 }
 
 async function getFinalAnswer(processedImageData: string, userQuery: string, refinedQuery: string, processingType: string): Promise<string> {

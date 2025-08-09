@@ -160,7 +160,7 @@ Respond in JSON format:
 
 async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string }> {
   // First try model server
-  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
   const requestBody = {
     image_path: imagePath,
     query,

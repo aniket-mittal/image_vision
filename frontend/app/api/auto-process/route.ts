@@ -142,7 +142,7 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     overlay_strength: parameters.overlay_strength ?? 1.0,
     output_dir: "temp_output",
   }
-  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
   const res = await fetch(`${MODEL_SERVER_URL}/attention`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -157,7 +157,7 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
 
 async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string }> {
   // Try model server first
-  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
   const requestBody = {
     image_path: imagePath,
     query,

@@ -20,8 +20,8 @@ function simpleHash(input: string): string {
 
 async function detectAllObjects(imagePath: string, prompt = "object"): Promise<any> {
   // Prefer OBJECTS_SERVER_URL if provided, else use MODEL_SERVER_URL if available
-  const OBJECTS_SERVER_URL = process.env.OBJECTS_SERVER_URL
-  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const OBJECTS_SERVER_URL = (process.env.OBJECTS_SERVER_URL || "").replace(/\/+$/, "")
+  const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
   const baseUrl = OBJECTS_SERVER_URL || MODEL_SERVER_URL
   try {
     const resp = await fetch(`${baseUrl}/detect_all`, {
@@ -82,7 +82,8 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ cached: false, ...result })
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Detection failed" }, { status: 500 })
+    // Return a friendly empty response instead of 500 so the UI can continue
+    return NextResponse.json({ image: null, objects: [], error: e?.message || "Detection failed" }, { status: 200 })
   }
 }
 
@@ -100,8 +101,8 @@ export async function PUT(req: NextRequest) {
     const imagePath = join(tempDir, `click_${Date.now()}.jpg`)
     await writeFile(imagePath, buf)
 
-    const OBJECTS_SERVER_URL = process.env.OBJECTS_SERVER_URL
-    const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+    const OBJECTS_SERVER_URL = (process.env.OBJECTS_SERVER_URL || "").replace(/\/+$/, "")
+    const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
     const baseUrl = OBJECTS_SERVER_URL || MODEL_SERVER_URL
     if (baseUrl) {
       const resp = await fetch(`${baseUrl}/sam_click`, {
