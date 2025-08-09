@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server"
-import { spawn } from "child_process"
 import { writeFile, mkdir } from "fs/promises"
 import { join } from "path"
 import { tmpdir } from "os"
@@ -161,10 +160,11 @@ Respond in JSON format:
   }
 }
 
-async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string }> {
-  // Try model server first
+async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string; backend: "model-server" }> {
+  // Only call the model server; no local fallbacks
   const requestBody = {
     image_path: imagePath,
+    image_data: await import("fs/promises").then(fs => fs.readFile(imagePath).then(b=>`data:image/jpeg;base64,${b.toString("base64")}`)),
     query,
     layer_index: parameters.layer_index ?? 23,
     enhancement_control: parameters.enhancement_control ?? 5.0,
@@ -174,57 +174,17 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     output_dir: "temp_output",
   }
   const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
-  try {
-    const res = await fetch(`${MODEL_SERVER_URL}/attention`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    })
-    if (res.ok) {
-      const data = await res.json()
-      return { savedPath: data.saved, processedImageData: data.processedImageData }
-    }
-  } catch (_) {
-    // fall through
-  }
-  // Fallback: local python runner
-  return await new Promise((resolve, reject) => {
-    const cwd = "/Users/aniketmittal/Desktop/code/image_vision"
-    const args = [
-      "run_attention_masks.py",
-      imagePath,
-      query,
-      "--layer_index",
-      String(parameters.layer_index ?? 23),
-      "--enhancement_control",
-      String(parameters.enhancement_control ?? 5.0),
-      "--smoothing_kernel",
-      String(parameters.smoothing_kernel ?? 3),
-      "--grayscale_level",
-      String(parameters.grayscale_level ?? 200),
-      "--overlay_strength",
-      String(parameters.overlay_strength ?? 1.0),
-      "--output_dir",
-      "temp_output",
-    ]
-    const py = spawn("conda", ["run", "-n", "clip_api", "python", ...args], { cwd })
-    let out = ""
-    let err = ""
-    py.stdout.on("data", (d) => (out += d.toString()))
-    py.stderr.on("data", (d) => (err += d.toString()))
-    py.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Attention script failed ${code}: ${err}`))
-        return
-      }
-      const match = out.match(/Saved to: (.+\.jpg)/)
-      if (match) {
-        resolve({ savedPath: match[1] })
-      } else {
-        reject(new Error("Could not parse attention output path"))
-      }
-    })
+  const res = await fetch(`${MODEL_SERVER_URL}/attention`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
   })
+  if (!res.ok) {
+    throw new Error(`Model server attention failed ${res.status}: ${await res.text()}`)
+  }
+  const data = await res.json()
+  console.log("[Attention] Using model-server backend")
+  return { savedPath: data.saved, processedImageData: data.processedImageData, backend: "model-server" }
 }
 
 async function getFinalAnswer(processedImageData: string, userQuery: string, refinedQuery: string, processingType: string): Promise<string> {
@@ -342,23 +302,12 @@ export async function POST(req: NextRequest) {
         refinedQuery,
         processingType: "attention",
         parameters,
-        answer
-      })
-    } catch (pythonError) {
-      console.error("Python script error:", pythonError)
-      // Fallback to original image if Python processing fails
-      console.log("Getting final answer with original image due to Python processing failure...")
-      const answer = await getFinalAnswer(imageData, userQuery, refinedQuery, "attention (original image)")
-      console.log("Answer generated with original image:", answer.substring(0, 100) + "...")
-      
-      return NextResponse.json({
-        processedImageData: imageData,
-        refinedQuery,
-        processingType: "attention",
-        parameters,
         answer,
-        error: "Python processing failed, using original image"
+        backend: result.backend
       })
+    } catch (err: any) {
+      console.error("[Attention] Model server error:", err?.message || String(err))
+      return NextResponse.json({ error: err?.message || "Attention model server error" }, { status: 502 })
     }
 
   } catch (error) {

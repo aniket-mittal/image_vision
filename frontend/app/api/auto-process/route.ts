@@ -1,7 +1,7 @@
 import { openai } from "@ai-sdk/openai"
 import { streamText } from "ai"
 import { NextRequest, NextResponse } from "next/server"
-import { spawn } from "child_process"
+// Removed local python fallbacks – enforce model-server only
 import { writeFile, mkdir } from "fs/promises"
 import { join } from "path"
 import { tmpdir } from "os"
@@ -130,10 +130,11 @@ async function determineProcessingStrategy(userQuery: string, imageCaption: stri
   }
 }
 
-async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string }> {
+async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string; backend: "model-server" }> {
   // Use persistent model server to avoid reloading CLIP per request
   const requestBody = {
     image_path: imagePath,
+    image_data: await import("fs/promises").then(fs => fs.readFile(imagePath).then(b=>`data:image/jpeg;base64,${b.toString("base64")}`)),
     query,
     layer_index: parameters.layer_index ?? 23,
     enhancement_control: parameters.enhancement_control ?? 5.0,
@@ -148,79 +149,32 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
   })
-  if (!res.ok) {
-    throw new Error(`Model server error ${res.status}: ${await res.text()}`)
-  }
+  if (!res.ok) throw new Error(`Model server error ${res.status}: ${await res.text()}`)
   const data = await res.json()
-  return { savedPath: data.saved, processedImageData: data.processedImageData }
+  return { savedPath: data.saved, processedImageData: data.processedImageData, backend: "model-server" }
 }
 
-async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string }> {
+async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string; backend: "model-server" }> {
   // Try model server first
   const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
   const requestBody = {
     image_path: imagePath,
+    image_data: await import("fs/promises").then(fs => fs.readFile(imagePath).then(b=>`data:image/jpeg;base64,${b.toString("base64")}`)),
     query,
     blur_strength: parameters.blur_strength ?? 15,
     padding: parameters.padding ?? 20,
     mask_type: parameters.mask_type || "precise",
     output_dir: "temp_output",
   }
-  try {
-    const res = await fetch(`${MODEL_SERVER_URL}/segmentation`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    })
-    if (res.ok) {
-      const data = await res.json()
-      if (data.processedImageData) return { processedImageData: data.processedImageData }
-    }
-  } catch (_) {
-    // fall through
-  }
-
-  // Fallback: local python
-  return await new Promise((resolve, reject) => {
-    const maskType = parameters.mask_type || "precise"
-    const cwd = "/Users/aniketmittal/Desktop/code/image_vision"
-    const pythonProcess = spawn("conda", [
-      "run", "-n", "clip_api", "python",
-      join(cwd, "run_segmentation.py"),
-      imagePath,
-      query,
-      "--blur_strength", parameters.blur_strength?.toString() || "15",
-      "--padding", parameters.padding?.toString() || "20",
-      "--output_dir", "temp_output"
-    ], {
-      cwd: cwd
-    })
-
-    let output = ""
-    let errorOutput = ""
-
-    pythonProcess.stdout.on("data", (data) => {
-      output += data.toString()
-    })
-
-    pythonProcess.stderr.on("data", (data) => {
-      errorOutput += data.toString()
-    })
-
-    pythonProcess.on("close", (code) => {
-      if (code === 0) {
-        const filePattern = maskType === "oval" ? /Saved oval mask to: (.+\.jpg)/ : /Saved precise mask to: (.+\.jpg)/
-        const match = output.match(filePattern)
-        if (match) {
-          resolve({ savedPath: match[1] })
-        } else {
-          reject(new Error("Could not find output file path"))
-        }
-      } else {
-        reject(new Error(`Process failed with code ${code}: ${errorOutput}`))
-      }
-    })
+  const res = await fetch(`${MODEL_SERVER_URL}/segmentation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
   })
+  if (!res.ok) throw new Error(`Model server error ${res.status}: ${await res.text()}`)
+  const data = await res.json()
+  if (!data.processedImageData) throw new Error("Model server segmentation did not return processedImageData")
+  return { processedImageData: data.processedImageData, backend: "model-server" }
 }
 
 async function getFinalAnswer(processedImageData: string, userQuery: string, refinedQuery: string, processingType: string): Promise<string> {
@@ -330,10 +284,8 @@ async function processImage(imageData: string, userQuery: string): Promise<Proce
             throw new Error("Model server did not return image data")
           }
           console.log("[Auto] Attention inference done")
-        } catch (pythonError) {
-          console.error("Python script error in auto-process attention:", pythonError)
-          // Fallback to original image if Python processing fails
-          processedImageData = imageData
+        } catch (err: any) {
+          throw err
         }
       } else if (strategy.processingType === "segmentation") {
         try {
@@ -349,10 +301,8 @@ async function processImage(imageData: string, userQuery: string): Promise<Proce
             throw new Error("Segmentation did not return image data")
           }
           console.log("[Auto] Segmentation inference done")
-        } catch (pythonError) {
-          console.error("Python script error in auto-process segmentation:", pythonError)
-          // Fallback to original image if Python processing fails
-          processedImageData = imageData
+        } catch (err: any) {
+          throw err
         }
       }
     }
