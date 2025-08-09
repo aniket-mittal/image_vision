@@ -5,7 +5,7 @@ import { tmpdir } from "os"
 import { createCanvas, loadImage } from "canvas"
 
 // OpenAI API key
-const OPENAI_API_KEY = "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"
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY as string
 
 async function generateImageCaption(imageData: string): Promise<string> {
   try {
