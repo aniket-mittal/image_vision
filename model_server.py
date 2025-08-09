@@ -150,8 +150,10 @@ class Handler(BaseHTTPRequestHandler):
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
                 out_path = os.path.join(output_dir, f"{base_name}_clip_masked.jpg")
                 masked_image.save(out_path)
+                # Also return base64 data URL for direct consumption
+                b64 = np_to_jpeg_base64(masked_image)
                 print("[ModelServer] Attention inference done", {"saved": out_path})
-                return self._send(200, {"saved": out_path})
+                return self._send(200, {"saved": out_path, "processedImageData": f"data:image/jpeg;base64,{b64}"})
             except Exception as e:
                 print("[ModelServer] Attention inference error", e)
                 return self._send(500, {"error": str(e)})

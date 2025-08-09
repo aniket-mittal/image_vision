@@ -158,8 +158,33 @@ Respond in JSON format:
   }
 }
 
-async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<string> {
-  return new Promise((resolve, reject) => {
+async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string }> {
+  // First try model server
+  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const requestBody = {
+    image_path: imagePath,
+    query,
+    blur_strength: parameters.blur_strength ?? 15,
+    padding: parameters.padding ?? 20,
+    mask_type: parameters.mask_type || "precise",
+    output_dir: "temp_output",
+  }
+  try {
+    const res = await fetch(`${MODEL_SERVER_URL}/segmentation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      if (data.processedImageData) return { processedImageData: data.processedImageData }
+    }
+  } catch (_) {
+    // fall through to local
+  }
+
+  // Fallback: local python script
+  return await new Promise((resolve, reject) => {
     const maskType = parameters.mask_type || "precise"
     const pythonProcess = spawn("conda", [
       "run", "-n", "clip_api", "python",
@@ -186,11 +211,10 @@ async function runSegmentationMasking(imagePath: string, query: string, paramete
 
     pythonProcess.on("close", (code) => {
       if (code === 0) {
-        // Find the output file path based on mask type
         const filePattern = maskType === "oval" ? /💾 Saved oval mask to: (.+\.jpg)/ : /💾 Saved precise mask to: (.+\.jpg)/
         const match = output.match(filePattern)
         if (match) {
-          resolve(match[1])
+          resolve({ savedPath: match[1] })
         } else {
           reject(new Error("Could not find output file path"))
         }
@@ -292,10 +316,17 @@ export async function POST(req: NextRequest) {
 
     try {
       console.log("[Segmentation] Inference start")
-      const outputPath = await runSegmentationMasking(imagePath, refinedQuery, parameters)
-      const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", outputPath)
-      const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
-      const processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+      const result = await runSegmentationMasking(imagePath, refinedQuery, parameters)
+      let processedImageData: string
+      if (result.processedImageData) {
+        processedImageData = result.processedImageData
+      } else if (result.savedPath) {
+        const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", result.savedPath)
+        const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
+        processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+      } else {
+        throw new Error("Segmentation did not return image data")
+      }
 
       console.log("[Segmentation] Inference done")
 

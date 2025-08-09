@@ -13,11 +13,11 @@ async function processImageForMode(processingMode: string, imageData: string, us
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages, processingMode, aiModel, imageData, selection, useOriginalImage } = await req.json()
+    const { messages, processingMode, aiModel, imageData, processedImageData: processedFromClient, selection, useOriginalImage } = await req.json()
 
     console.log("Received request:", { processingMode, aiModel, useOriginalImage, hasImage: !!imageData })
 
-    let processedImageData = imageData
+    let processedImageData = processedFromClient || imageData
     let refinedQuery = messages[messages.length - 1]?.content || ""
 
     // Handle "Use Original Image" case

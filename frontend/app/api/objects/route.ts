@@ -19,15 +19,19 @@ function simpleHash(input: string): string {
 }
 
 async function detectAllObjects(imagePath: string, prompt = "object"): Promise<any> {
+  // Prefer OBJECTS_SERVER_URL if provided, else use MODEL_SERVER_URL if available
   const OBJECTS_SERVER_URL = process.env.OBJECTS_SERVER_URL
-  if (OBJECTS_SERVER_URL) {
-    const resp = await fetch(`${OBJECTS_SERVER_URL}/detect_all`, {
+  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const baseUrl = OBJECTS_SERVER_URL || MODEL_SERVER_URL
+  try {
+    const resp = await fetch(`${baseUrl}/detect_all`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image_path: imagePath, prompt }),
     })
-    if (!resp.ok) throw new Error(`Remote detect_all failed ${resp.status}`)
-    return resp.json()
+    if (resp.ok) return resp.json()
+  } catch (_) {
+    // fall back to local
   }
   // Fallback: local spawn
   return new Promise((resolve, reject) => {
@@ -97,8 +101,10 @@ export async function PUT(req: NextRequest) {
     await writeFile(imagePath, buf)
 
     const OBJECTS_SERVER_URL = process.env.OBJECTS_SERVER_URL
-    if (OBJECTS_SERVER_URL) {
-      const resp = await fetch(`${OBJECTS_SERVER_URL}/sam_click`, {
+    const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+    const baseUrl = OBJECTS_SERVER_URL || MODEL_SERVER_URL
+    if (baseUrl) {
+      const resp = await fetch(`${baseUrl}/sam_click`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_path: imagePath, x, y, blur_strength: blurStrength ?? 15 }),

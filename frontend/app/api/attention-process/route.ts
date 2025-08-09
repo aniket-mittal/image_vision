@@ -161,7 +161,7 @@ Respond in JSON format:
   }
 }
 
-async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<string> {
+async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string }> {
   // Call model server for persistent CLIP inference to avoid reloading
   const requestBody = {
     image_path: imagePath,
@@ -183,9 +183,7 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     throw new Error(`Model server error ${res.status}: ${await res.text()}`)
   }
   const data = await res.json()
-  if (!data.saved) throw new Error("Model server did not return saved path")
-  // The server returns an absolute or relative path; return relative from project root
-  return data.saved
+  return { savedPath: data.saved, processedImageData: data.processedImageData }
 }
 
 async function getFinalAnswer(processedImageData: string, userQuery: string, refinedQuery: string, processingType: string): Promise<string> {
@@ -279,10 +277,17 @@ export async function POST(req: NextRequest) {
 
     try {
       console.log("[Attention] Inference start")
-      const outputPath = await runAttentionMasking(imagePath, refinedQuery, parameters)
-      const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", outputPath)
-      const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
-      const processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+      const result = await runAttentionMasking(imagePath, refinedQuery, parameters)
+      let processedImageData: string
+      if (result.processedImageData) {
+        processedImageData = result.processedImageData
+      } else if (result.savedPath) {
+        const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", result.savedPath)
+        const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
+        processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+      } else {
+        throw new Error("Model server did not return image data")
+      }
 
       console.log("[Attention] Inference done")
 

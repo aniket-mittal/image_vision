@@ -130,7 +130,7 @@ async function determineProcessingStrategy(userQuery: string, imageCaption: stri
   }
 }
 
-async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<string> {
+async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string }> {
   // Use persistent model server to avoid reloading CLIP per request
   const requestBody = {
     image_path: imagePath,
@@ -152,12 +152,36 @@ async function runAttentionMasking(imagePath: string, query: string, parameters:
     throw new Error(`Model server error ${res.status}: ${await res.text()}`)
   }
   const data = await res.json()
-  if (!data.saved) throw new Error("Model server did not return saved path")
-  return data.saved
+  return { savedPath: data.saved, processedImageData: data.processedImageData }
 }
 
-async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<string> {
-  return new Promise((resolve, reject) => {
+async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string }> {
+  // Try model server first
+  const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765"
+  const requestBody = {
+    image_path: imagePath,
+    query,
+    blur_strength: parameters.blur_strength ?? 15,
+    padding: parameters.padding ?? 20,
+    mask_type: parameters.mask_type || "precise",
+    output_dir: "temp_output",
+  }
+  try {
+    const res = await fetch(`${MODEL_SERVER_URL}/segmentation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      if (data.processedImageData) return { processedImageData: data.processedImageData }
+    }
+  } catch (_) {
+    // fall through
+  }
+
+  // Fallback: local python
+  return await new Promise((resolve, reject) => {
     const maskType = parameters.mask_type || "precise"
     const cwd = "/Users/aniketmittal/Desktop/code/image_vision"
     const pythonProcess = spawn("conda", [
@@ -185,11 +209,10 @@ async function runSegmentationMasking(imagePath: string, query: string, paramete
 
     pythonProcess.on("close", (code) => {
       if (code === 0) {
-        // Find the output file path based on mask type
         const filePattern = maskType === "oval" ? /Saved oval mask to: (.+\.jpg)/ : /Saved precise mask to: (.+\.jpg)/
         const match = output.match(filePattern)
         if (match) {
-          resolve(match[1])
+          resolve({ savedPath: match[1] })
         } else {
           reject(new Error("Could not find output file path"))
         }
@@ -296,10 +319,16 @@ async function processImage(imageData: string, userQuery: string): Promise<Proce
       if (strategy.processingType === "attention") {
         try {
           console.log("[Auto] Attention inference start")
-          const outputPath = await runAttentionMasking(imagePath, strategy.refinedQuery, strategy.parameters)
-          const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", outputPath)
-          const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
-          processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+          const attnResult = await runAttentionMasking(imagePath, strategy.refinedQuery, strategy.parameters)
+          if (attnResult.processedImageData) {
+            processedImageData = attnResult.processedImageData
+          } else if (attnResult.savedPath) {
+            const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", attnResult.savedPath)
+            const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
+            processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+          } else {
+            throw new Error("Model server did not return image data")
+          }
           console.log("[Auto] Attention inference done")
         } catch (pythonError) {
           console.error("Python script error in auto-process attention:", pythonError)
@@ -309,10 +338,16 @@ async function processImage(imageData: string, userQuery: string): Promise<Proce
       } else if (strategy.processingType === "segmentation") {
         try {
           console.log("[Auto] Segmentation inference start")
-          const outputPath = await runSegmentationMasking(imagePath, strategy.refinedQuery, strategy.parameters)
-          const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", outputPath)
-          const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
-          processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+          const segResult = await runSegmentationMasking(imagePath, strategy.refinedQuery, strategy.parameters)
+          if (segResult.processedImageData) {
+            processedImageData = segResult.processedImageData
+          } else if (segResult.savedPath) {
+            const absoluteOutputPath = join("/Users/aniketmittal/Desktop/code/image_vision", segResult.savedPath)
+            const processedImageBuffer = await import("fs/promises").then(fs => fs.readFile(absoluteOutputPath))
+            processedImageData = `data:image/jpeg;base64,${processedImageBuffer.toString("base64")}`
+          } else {
+            throw new Error("Segmentation did not return image data")
+          }
           console.log("[Auto] Segmentation inference done")
         } catch (pythonError) {
           console.error("Python script error in auto-process segmentation:", pythonError)

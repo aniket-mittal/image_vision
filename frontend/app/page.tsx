@@ -268,6 +268,7 @@ export default function AIImageAnalyzer() {
           processingMode,
           aiModel,
           imageData: uploadedImage,
+          processedImageData: processedImage,
             // For chat context, include the most recent ROI selection if any
             selection: (selections.filter((s) => s.type === "crop" || s.type === "lasso").slice(-1)[0] ?? null),
           useOriginalImage,
@@ -455,32 +456,38 @@ export default function AIImageAnalyzer() {
 
     // Call backend to run SAM-click
     try {
-      console.log("[ObjectSelector] SAM-click inference start", { x: origX, y: origY })
-      const res = await fetch("/api/objects", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageData: uploadedImage, x: Math.round(origX), y: Math.round(origY), blurStrength: 15 }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        setProcessedImage(data.processedImageData)
-        // Update overlay to match returned bbox (scale to display)
-        if (data.bbox && imageNaturalSize && imageRef.current) {
-          const [bx1, by1, bx2, by2] = data.bbox as number[]
-          const scaleX2 = imageRef.current.offsetWidth / imageNaturalSize.w
-          const scaleY2 = imageRef.current.offsetHeight / imageNaturalSize.h
-          const sel: Selection = {
-            type: "object-selector",
-            coordinates: [bx1 * scaleX2, by1 * scaleY2, bx2 * scaleX2, by2 * scaleY2],
-            imageData: uploadedImage,
-          }
-          setSelections([sel])
-          drawHighlightOverlay([sel])
-          console.log("[ObjectSelector] SAM-click inference done")
-        }
-      }
+      await runSamClickAt(Math.round(origX), Math.round(origY))
     } catch (_) {}
   }, [selectedTool, detectedObjects, uploadedImage, imageNaturalSize, drawHighlightOverlay])
+
+  // Helper: run SAM-click at original-image coordinates
+  const runSamClickAt = useCallback(async (origX: number, origY: number) => {
+    if (!uploadedImage) return
+    console.log("[ObjectSelector] SAM-click inference start", { x: origX, y: origY })
+    const res = await fetch("/api/objects", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageData: uploadedImage, x: origX, y: origY, blurStrength: 15 }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      setProcessedImage(data.processedImageData)
+      // Update overlay to match returned bbox (scale to display)
+      if (data.bbox && imageNaturalSize && imageRef.current) {
+        const [bx1, by1, bx2, by2] = data.bbox as number[]
+        const scaleX2 = imageRef.current.offsetWidth / imageNaturalSize.w
+        const scaleY2 = imageRef.current.offsetHeight / imageNaturalSize.h
+        const sel: Selection = {
+          type: "object-selector",
+          coordinates: [bx1 * scaleX2, by1 * scaleY2, bx2 * scaleX2, by2 * scaleY2],
+          imageData: uploadedImage,
+        }
+        setSelections([sel])
+        drawHighlightOverlay([sel])
+        console.log("[ObjectSelector] SAM-click inference done")
+      }
+    }
+  }, [uploadedImage, imageNaturalSize, drawHighlightOverlay])
 
   // Clear overlay when selection is cleared or image changes
   useEffect(() => {
@@ -513,11 +520,20 @@ export default function AIImageAnalyzer() {
         if (res.ok) {
           const data = await res.json()
           setDetectedObjects(data.objects || [])
+          // Auto-select first object to highlight and pre-blur background
+          if ((data.objects || []).length > 0 && imageRef.current && imageNaturalSize) {
+            const first = data.objects[0]
+            // Compute click point at object center in original image coords
+            const [x1, y1, x2, y2] = first.bbox as number[]
+            const cx = Math.round((x1 + x2) / 2)
+            const cy = Math.round((y1 + y2) / 2)
+            await runSamClickAt(cx, cy)
+          }
         }
       } catch (_) {}
     }
     detect()
-  }, [uploadedImage])
+  }, [uploadedImage, imageNaturalSize, runSamClickAt])
 
   return (
     <div className="flex h-screen bg-gray-50">
