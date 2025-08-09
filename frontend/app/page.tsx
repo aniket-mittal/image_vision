@@ -422,6 +422,8 @@ export default function AIImageAnalyzer() {
   const handleCanvasMouseMove = useCallback(
     (event: React.MouseEvent<HTMLCanvasElement>) => {
       if (!isDrawing || !canvasRef.current) return
+      // Guard: if base <img> not ready/broken, skip drawing
+      if (!imageRef.current || !imageRef.current.complete) return
 
       const rect = canvasRef.current.getBoundingClientRect()
       const x = event.clientX - rect.left
@@ -731,6 +733,12 @@ export default function AIImageAnalyzer() {
                       }
                     }
                   }
+                }}
+                onError={() => {
+                  // Fallback: clear overlay to avoid drawImage on broken img
+                  const canvas = canvasRef.current
+                  const ctx = canvas?.getContext("2d")
+                  if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
                 }}
               />
               <canvas

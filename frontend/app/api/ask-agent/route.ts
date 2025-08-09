@@ -266,23 +266,8 @@ export async function POST(req: NextRequest) {
       }
       lastSuggestion = verdict.suggestion || null
 
-      // Generate a compact natural language narrative for this step
-      let narrative = ""
-      try {
-        const narrSys = { role: "system", content: "Write one short sentence (max ~15 words) describing the image action. No punctuation list markers. No quotes." }
-        const keyParams = (() => {
-          const { spatial_bias, mask_type, blur_strength, layer_index } = plan.params || {}
-          const arr = [] as string[]
-          if (spatial_bias) arr.push(`bias:${spatial_bias}`)
-          if (mask_type) arr.push(`mask:${mask_type}`)
-          if (typeof blur_strength !== "undefined") arr.push(`blur:${blur_strength}`)
-          if (typeof layer_index !== "undefined") arr.push(`layer:${layer_index}`)
-          return arr.join(", ")
-        })()
-        const narrUser = { role: "user", content: `Technique: ${plan.technique}\nTarget: ${plan.refinedQuery}\nParams: ${keyParams || "-"}\nOCR hint: ${ocrSummary}` }
-        const narr = await callOpenAI([narrSys, narrUser], 60)
-        narrative = (narr.choices?.[0]?.message?.content || "").trim()
-      } catch {}
+      // Deterministic concise narrative to display inline
+      const narrative = `Running ${plan.technique} to look for ${plan.refinedQuery}.`
       steps.push({ processedImageData: processed, technique: plan.technique, refinedQuery: plan.refinedQuery, params: plan.params, rationale: plan.rationale, narrative })
 
       if (verdict.score > bestScore) {
