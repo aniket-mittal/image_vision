@@ -53,6 +53,7 @@ export default function AIImageAnalyzer() {
 
   // Custom chat state
   const [messages, setMessages] = useState<Message[]>([])
+  const [agentEvents, setAgentEvents] = useState<string[]>([])
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
@@ -252,6 +253,18 @@ export default function AIImageAnalyzer() {
               console.log("Processing result:", processResult)
               const finalImg = processResult?.final?.processedImageData || processResult.processedImageData
               if (finalImg) setProcessedImage(finalImg)
+              // Append chain-of-thought style telemetry for the UI (not revealing model internals)
+              if (processResult?.steps && Array.isArray(processResult.steps)) {
+                const logs: string[] = []
+                processResult.steps.forEach((s: any, idx: number) => {
+                  const parts = [] as string[]
+                  parts.push(`Step ${idx + 1}: ${s.technique} → "${s.refinedQuery}"`)
+                  if (s.params) parts.push(`params=${JSON.stringify(s.params)}`)
+                  if (s.rationale) parts.push(`note=${s.rationale}`)
+                  logs.push(parts.join(" | "))
+                })
+                setAgentEvents((prev) => [...prev, ...logs])
+              }
               
               // If the processing API returned an answer, use it directly
               if (processResult.answer) {
@@ -930,6 +943,21 @@ export default function AIImageAnalyzer() {
                 )}
               </div>
             </ScrollArea>
+
+            {/* Agent activity trace */}
+            {agentEvents.length > 0 && (
+              <div className="mt-2 border rounded-lg p-2 bg-white">
+                <div className="text-xs font-semibold text-gray-700 mb-1">Agent activity</div>
+                <div className="space-y-1 max-h-40 overflow-auto text-[11px] text-gray-700">
+                  {agentEvents.map((e, i) => (
+                    <div key={i} className="flex items-start space-x-1">
+                      <span className="text-gray-400">•</span>
+                      <span>{e}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Chat Input */}
             <div className="border-t pt-4">

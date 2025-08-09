@@ -40,6 +40,9 @@ async function runAttention(imagePath: string, query: string, p: any) {
     smoothing_kernel: p.smoothing_kernel ?? 3,
     grayscale_level: p.grayscale_level ?? 200,
     overlay_strength: p.overlay_strength ?? 1.0,
+    // Optional spatial hinting for disambiguation like "left bird" vs "right bird"
+    spatial_bias: p.spatial_bias,
+    bbox_bias: p.bbox_bias,
     output_dir: "temp_output",
   }
   const r = await fetch(`${MODEL_SERVER_URL}/attention`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
@@ -180,6 +183,33 @@ export async function POST(req: NextRequest) {
         plan = { technique: "attention", refinedQuery: userQuery, params: {}, rationale: "fallback" }
       }
 
+      // Heuristic: derive spatial_bias when the refined query references sides
+      const rq = (plan.refinedQuery || "").toLowerCase()
+      if (!plan.params) plan.params = {}
+      if (!plan.params.spatial_bias) {
+        if (rq.includes("left")) plan.params.spatial_bias = "left"
+        else if (rq.includes("right")) plan.params.spatial_bias = "right"
+        else if (rq.includes("top") || rq.includes("upper")) plan.params.spatial_bias = "top"
+        else if (rq.includes("bottom") || rq.includes("lower")) plan.params.spatial_bias = "bottom"
+      }
+      if (!plan.params.bbox_bias && plan.params.spatial_bias) {
+        // Provide a coarse bbox bias to amplify side-specific focus
+        switch (plan.params.spatial_bias) {
+          case "left":
+            plan.params.bbox_bias = [0.0, 0.0, 0.5, 1.0]
+            break
+          case "right":
+            plan.params.bbox_bias = [0.5, 0.0, 1.0, 1.0]
+            break
+          case "top":
+            plan.params.bbox_bias = [0.0, 0.0, 1.0, 0.5]
+            break
+          case "bottom":
+            plan.params.bbox_bias = [0.0, 0.5, 1.0, 1.0]
+            break
+        }
+      }
+
       // Special handling for charts/graphs: if OCR suggests structured labels, allow a text-region focus before tools
       if (ocr?.layout?.candidates && i === 0) {
         try {
@@ -255,17 +285,70 @@ export async function POST(req: NextRequest) {
       if (Array.isArray(parsed?.subQuestions)) subQuestions = parsed.subQuestions
     } catch {}
 
+    // Per-subquestion quick investigation (1 pass each) to build hidden context, bounded by mode
+    const maxSubQ = Math.min(subQuestions.length, (mode === "BlurDeep" ? 5 : 2))
+    const findings: string[] = []
+    for (let i = 0; i < maxSubQ; i++) {
+      const sq = (subQuestions[i] || "").trim()
+      if (!sq) continue
+      // Ask planner once for this sub-question
+      const sqPlannerUser = { role: "user", content: `Sub-question: ${sq}\nMain question: ${userQuery}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nRespond JSON: {\"technique\":\"attention|segmentation\",\"refinedQuery\":\"...\",\"params\":{...}}` }
+      let sqPlan: any = { technique: "attention", refinedQuery: sq, params: {} }
+      try {
+        const sqResp = await callOpenAI([sysPlanner, sqPlannerUser], 250)
+        const sqc = (sqResp.choices?.[0]?.message?.content || "{}").replace(/```json\n?/g, "").replace(/```\n?/g, "").trim()
+        sqPlan = JSON.parse(sqc)
+      } catch {}
+      const rq2 = (sqPlan.refinedQuery || sq).toLowerCase()
+      if (!sqPlan.params) sqPlan.params = {}
+      if (!sqPlan.params.spatial_bias) {
+        if (rq2.includes("left")) sqPlan.params.spatial_bias = "left"
+        else if (rq2.includes("right")) sqPlan.params.spatial_bias = "right"
+        else if (rq2.includes("top") || rq2.includes("upper")) sqPlan.params.spatial_bias = "top"
+        else if (rq2.includes("bottom") || rq2.includes("lower")) sqPlan.params.spatial_bias = "bottom"
+      }
+      if (!sqPlan.params.bbox_bias && sqPlan.params.spatial_bias) {
+        switch (sqPlan.params.spatial_bias) {
+          case "left": sqPlan.params.bbox_bias = [0.0, 0.0, 0.5, 1.0]; break
+          case "right": sqPlan.params.bbox_bias = [0.5, 0.0, 1.0, 1.0]; break
+          case "top": sqPlan.params.bbox_bias = [0.0, 0.0, 1.0, 0.5]; break
+          case "bottom": sqPlan.params.bbox_bias = [0.0, 0.5, 1.0, 1.0]; break
+        }
+      }
+      let sqImage = ""
+      try {
+        if (sqPlan.technique === "segmentation") sqImage = await runSegmentation(imagePath, sqPlan.refinedQuery, sqPlan.params)
+        else sqImage = await runAttention(imagePath, sqPlan.refinedQuery, sqPlan.params)
+        steps.push({ processedImageData: sqImage, technique: sqPlan.technique, refinedQuery: sqPlan.refinedQuery, params: sqPlan.params, rationale: `subq: ${sq}` })
+      } catch {}
+      // Optional: a brief internal finding
+      if (sqImage) {
+        try {
+          const findSys = { role: "system", content: "Given the sub-question and the processed image, extract one concise factual note (no enumeration, <25 words). Return plain text only." }
+          const findUser = { role: "user", content: [{ type: "text", text: `Sub-question: ${sq}` }, { type: "image_url", image_url: { url: sqImage } }] }
+          const f = await callOpenAI([findSys, findUser], 120)
+          const txt = (f.choices?.[0]?.message?.content || "").trim()
+          if (txt) findings.push(txt)
+        } catch {}
+      }
+    }
+
     // Final answering on the best/last processed view
     const finalImage = lastProcessed || imageData
     const finalMessages = [
       {
         role: "system",
-        content: `You are an expert vision assistant. Provide a precise, well-grounded answer. If text in the scene matters, incorporate OCR context if relevant. Consider the sub-questions provided to structure your reasoning if helpful.`,
+        content: `You are an expert vision assistant. Provide a precise, well-grounded answer.
+Rules:
+- Do NOT expose internal sub-questions or an outline.
+- Avoid numbered lists unless explicitly asked.
+- Synthesize into a single, coherent answer in natural prose.
+If text in the scene matters, incorporate OCR context implicitly.`,
       },
       {
         role: "user",
         content: [
-          { type: "text", text: `Question: ${userQuery}\nRefined: ${lastRefined || userQuery}\nTechnique: ${lastTechnique}\nOCR: ${ocr.text || "<none>"}\nOCR Layout: ${ocrSummary}\nSub-questions: ${subQuestions.length ? subQuestions.join(" | ") : "<none>"}` },
+          { type: "text", text: `Question: ${userQuery}\nContext (internal findings, do not verbatim list them): ${findings.join(" | ")}` },
           { type: "image_url", image_url: { url: finalImage } },
         ],
       },

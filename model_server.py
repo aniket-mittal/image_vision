@@ -293,6 +293,8 @@ class Handler(BaseHTTPRequestHandler):
             smoothing_kernel = int(payload.get("smoothing_kernel", 3))
             grayscale_level = int(payload.get("grayscale_level", 100))
             overlay_strength = float(payload.get("overlay_strength", 1.0))
+            spatial_bias = payload.get("spatial_bias", None)  # left|right|top|bottom
+            bbox_bias = payload.get("bbox_bias", None)  # [x1,y1,x2,y2] in absolute pixels or 0..1
             output_dir = payload.get("output_dir", "temp_output")
 
             if not image_path or not os.path.exists(image_path):
@@ -319,6 +321,41 @@ class Handler(BaseHTTPRequestHandler):
                 am = _first_map(attention_maps)
                 tm = _first_map(token_maps)
                 pil_image = Image.open(image_path).convert("RGB")
+                # Apply optional spatial bias to attention map
+                try:
+                    import numpy as _np
+                    h, w = am.shape[-2], am.shape[-1]
+                    weight = _np.ones((h, w), dtype=_np.float32)
+                    if isinstance(spatial_bias, str):
+                        if spatial_bias == "left":
+                            ramp = _np.linspace(1.5, 0.5, w).astype(_np.float32)
+                            weight *= ramp[None, :]
+                        elif spatial_bias == "right":
+                            ramp = _np.linspace(0.5, 1.5, w).astype(_np.float32)
+                            weight *= ramp[None, :]
+                        elif spatial_bias == "top":
+                            ramp = _np.linspace(1.5, 0.5, h).astype(_np.float32)
+                            weight *= ramp[:, None]
+                        elif spatial_bias == "bottom":
+                            ramp = _np.linspace(0.5, 1.5, h).astype(_np.float32)
+                            weight *= ramp[:, None]
+                    if bbox_bias is not None and isinstance(bbox_bias, (list, tuple)) and len(bbox_bias) == 4:
+                        x1, y1, x2, y2 = bbox_bias
+                        # Normalize if values in 0..1
+                        if 0.0 <= x1 <= 1.0 and 0.0 <= y1 <= 1.0 and 0.0 <= x2 <= 1.0 and 0.0 <= y2 <= 1.0:
+                            x1, y1, x2, y2 = int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+                        x1 = max(0, min(int(x1), w - 1))
+                        y1 = max(0, min(int(y1), h - 1))
+                        x2 = max(0, min(int(x2), w - 1))
+                        y2 = max(0, min(int(y2), h - 1))
+                        if x2 < x1: x1, x2 = x2, x1
+                        if y2 < y1: y1, y2 = y2, y1
+                        weight[y1:y2+1, x1:x2+1] *= 1.6
+                    # Apply and renormalize
+                    am = am * torch.from_numpy(weight).to(am.device)
+                    am = am / (am.max() + 1e-6)
+                except Exception as _e:
+                    print("[ModelServer] spatial bias application failed:", _e)
                 masked_image, _ = CLIP_GEN.create_masked_image(
                     pil_image,
                     am,
