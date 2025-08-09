@@ -6,14 +6,13 @@ import { useState, useRef, useCallback, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Crop, Lasso, MousePointer, Upload, Send, Bot, User, ChevronLeft, ChevronRight, Eraser } from "lucide-react"
 
 type Tool = "crop" | "lasso" | "object-selector"
-type ProcessingMode = "Auto" | "Attention" | "Segmentation" | "Injection"
+type ProcessingMode = "Original" | "Auto" | "Attention" | "Segmentation" | "Injection"
 type AIModel = "GPT" | "Claude" | "Gemini" | "LLaVA" | "Qwen"
 
 interface Selection {
@@ -30,8 +29,7 @@ interface Message {
 
 export default function AIImageAnalyzer() {
   const [selectedTool, setSelectedTool] = useState<Tool>("crop")
-  const [useOriginalImage, setUseOriginalImage] = useState(true)
-  const [processingMode, setProcessingMode] = useState<ProcessingMode>("Auto")
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>("Original")
   const [aiModel, setAIModel] = useState<AIModel>("GPT")
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
   const [processedImage, setProcessedImage] = useState<string | null>(null)
@@ -49,7 +47,8 @@ export default function AIImageAnalyzer() {
 
   // Cached object detections from backend: list of { id, bbox: [x1,y1,x2,y2], label }
   const [detectedObjects, setDetectedObjects] = useState<Array<{id:number; bbox:number[]; label:string}>>([])
-  const [selectedObjectId, setSelectedObjectId] = useState<number | null>(null)
+  const [selectedObjectIds, setSelectedObjectIds] = useState<number[]>([])
+  const [selectedObjectPoints, setSelectedObjectPoints] = useState<Array<{id:number; x:number; y:number}>>([])
   const [imageNaturalSize, setImageNaturalSize] = useState<{w:number; h:number} | null>(null)
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -183,8 +182,8 @@ export default function AIImageAnalyzer() {
     setIsLoading(true)
 
     try {
-      // First, process the image if not using original
-      if (!useOriginalImage && processingMode !== "Injection") {
+      // First, process the image if processing is requested (not Original or Injection)
+      if (processingMode !== "Original" && processingMode !== "Injection") {
         try {
           let endpoint = ""
           let requestBody: any = {
@@ -256,10 +255,11 @@ export default function AIImageAnalyzer() {
           setProcessedImage(null)
         }
       } else {
+        // For Original mode (or Injection), ensure we send the original image to chat
         setProcessedImage(null)
       }
 
-      console.log("Calling chat API with useOriginalImage:", useOriginalImage)
+      console.log("Calling chat API (processedImage present?):", !!processedImage)
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -273,7 +273,6 @@ export default function AIImageAnalyzer() {
           processedImageData: processedImage,
             // For chat context, include the most recent ROI selection if any
             selection: (selections.filter((s) => s.type === "crop" || s.type === "lasso").slice(-1)[0] ?? null),
-          useOriginalImage,
         }),
       })
 
@@ -347,7 +346,8 @@ export default function AIImageAnalyzer() {
         setUploadedImage(e.target?.result as string)
         setSelections([])
         setDetectedObjects([])
-        setSelectedObjectId(null)
+        setSelectedObjectIds([])
+        setSelectedObjectPoints([])
         setHasAutoHighlighted(false)
       }
       reader.readAsDataURL(file)
@@ -421,13 +421,12 @@ export default function AIImageAnalyzer() {
 
   const handleObjectSelect = useCallback(async (event: React.MouseEvent<HTMLCanvasElement>) => {
     if (selectedTool !== "object-selector") return
-    const rect = canvasRef.current?.getBoundingClientRect()
-    if (!rect) return
+    if (!canvasRef.current) return
+    const rect = canvasRef.current.getBoundingClientRect()
     const x = event.clientX - rect.left
     const y = event.clientY - rect.top
 
-    // Choose the first object bbox that contains the click
-    // Scale bboxes to display size
+    // Choose the first object bbox that contains the click (display coords)
     const imgEl = imageRef.current
     let scaleX = 1, scaleY = 1
     if (imgEl && imageNaturalSize) {
@@ -442,10 +441,7 @@ export default function AIImageAnalyzer() {
       const y2 = by2 * scaleY
       return x >= x1 && x <= x2 && y >= y1 && y <= y2
     })
-
-    if (hit) {
-      setSelectedObjectId(hit.id)
-    }
+    if (!hit) return
 
     // Map display coordinates to original image coordinates
     let origX = x
@@ -457,39 +453,67 @@ export default function AIImageAnalyzer() {
       origY = y * sy
     }
 
-    // Call backend to run SAM-click
-    try {
-      await runSamClickAt(Math.round(origX), Math.round(origY))
-    } catch (_) {}
-  }, [selectedTool, detectedObjects, uploadedImage, imageNaturalSize, drawHighlightOverlay])
+    // Toggle selection and recompute
+    setSelectedObjectIds((prev) => {
+      const exists = prev.includes(hit.id)
+      const nextIds = exists ? prev.filter((id) => id !== hit.id) : [...prev, hit.id]
 
-  // Helper: run SAM-click at original-image coordinates
-  const runSamClickAt = useCallback(async (origX: number, origY: number) => {
+      setSelectedObjectPoints((prevPts) => {
+        const map = new Map(prevPts.map((p) => [p.id, p]))
+        if (exists) {
+          map.delete(hit.id)
+        } else {
+          map.set(hit.id, { id: hit.id, x: Math.round(origX), y: Math.round(origY) })
+        }
+        const nextPts = Array.from(map.values())
+        // Backend inference for all selected points
+        runSamMultiClick(nextPts.map((p) => ({ x: p.x, y: p.y }))).catch(() => {})
+
+        // Update overlay selections with all selected object boxes
+        const nonObjectSelections = selections.filter((s) => s.type !== "object-selector")
+        let sX = 1, sY = 1
+        if (imageRef.current && imageNaturalSize) {
+          sX = imageRef.current.offsetWidth / imageNaturalSize.w
+          sY = imageRef.current.offsetHeight / imageNaturalSize.h
+        }
+        const objectSelections = nextIds
+          .map((id) => detectedObjects.find((o) => o.id === id))
+          .filter(Boolean)
+          .map((o: any) => {
+            const [bx1, by1, bx2, by2] = o.bbox as number[]
+            const coords = [bx1 * sX, by1 * sY, bx2 * sX, by2 * sY]
+            return { type: "object-selector" as Tool, coordinates: coords, imageData: uploadedImage }
+          })
+        const merged = [...nonObjectSelections, ...objectSelections]
+        setSelections(merged)
+        drawHighlightOverlay(merged)
+
+        return nextPts
+      })
+
+      return nextIds
+    })
+  }, [selectedTool, detectedObjects, uploadedImage, imageNaturalSize, drawHighlightOverlay, selections])
+
+  // Helper: run SAM with multiple click points (original-image coordinates)
+  const runSamMultiClick = useCallback(async (points: Array<{ x: number; y: number }>) => {
     if (!uploadedImage) return
-    console.log("[ObjectSelector] SAM-click inference start", { x: origX, y: origY })
+    if (!points || points.length === 0) {
+      setProcessedImage(null)
+      return
+    }
+    console.log("[ObjectSelector] SAM-multi-click start", { count: points.length })
     const res = await fetch("/api/objects", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ imageData: uploadedImage, x: origX, y: origY, blurStrength: 15 }),
+      body: JSON.stringify({ imageData: uploadedImage, points, blurStrength: 15 }),
     })
     if (!res.ok) return
     const data = await res.json()
-    if (!data.processedImageData || !data.bbox) return
+    if (!data.processedImageData) return
     setProcessedImage(data.processedImageData)
-    if (imageNaturalSize && imageRef.current) {
-      const [bx1, by1, bx2, by2] = data.bbox as number[]
-      const scaleX2 = imageRef.current.offsetWidth / imageNaturalSize.w
-      const scaleY2 = imageRef.current.offsetHeight / imageNaturalSize.h
-      const sel: Selection = {
-        type: "object-selector",
-        coordinates: [bx1 * scaleX2, by1 * scaleY2, bx2 * scaleX2, by2 * scaleY2],
-        imageData: uploadedImage,
-      }
-      setSelections([sel])
-      drawHighlightOverlay([sel])
-      console.log("[ObjectSelector] SAM-click inference done")
-    }
-  }, [uploadedImage, imageNaturalSize, drawHighlightOverlay])
+    console.log("[ObjectSelector] SAM-multi-click done")
+  }, [uploadedImage])
 
   // Clear overlay when selection is cleared or image changes
   useEffect(() => {
@@ -529,8 +553,17 @@ export default function AIImageAnalyzer() {
             const [x1, y1, x2, y2] = first.bbox as number[]
             const cx = Math.round((x1 + x2) / 2)
             const cy = Math.round((y1 + y2) / 2)
-            // Fire and forget; do not await to avoid blocking state updates
-            runSamClickAt(cx, cy).catch(() => {})
+            setSelectedObjectIds([first.id])
+            setSelectedObjectPoints([{ id: first.id, x: cx, y: cy }])
+            // Build overlay selection box scaled to canvas
+            const sX = imageRef.current.offsetWidth / imageNaturalSize.w
+            const sY = imageRef.current.offsetHeight / imageNaturalSize.h
+            const sel: Selection = { type: "object-selector", coordinates: [x1 * sX, y1 * sY, x2 * sX, y2 * sY], imageData: uploadedImage }
+            const merged = [...selections.filter((s) => s.type !== "object-selector"), sel]
+            setSelections(merged)
+            drawHighlightOverlay(merged)
+            // Fire and forget single-point multi-click
+            runSamMultiClick([{ x: cx, y: cy }]).catch(() => {})
             setHasAutoHighlighted(true)
           }
         }
@@ -601,19 +634,7 @@ export default function AIImageAnalyzer() {
               )}
             </div>
 
-            <div className="flex items-center space-x-2">
-              <Switch 
-                id="use-original" 
-                checked={useOriginalImage} 
-                onCheckedChange={(checked) => {
-                  setUseOriginalImage(checked)
-                  if (checked) {
-                    setProcessedImage(null)
-                  }
-                }} 
-              />
-              <Label htmlFor="use-original">Use Original Image</Label>
-            </div>
+            <div className="flex items-center space-x-2"></div>
           </div>
         </div>
 
@@ -722,8 +743,9 @@ export default function AIImageAnalyzer() {
                     <SelectTrigger className="h-9 text-sm">
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="Auto">Auto</SelectItem>
+                     <SelectContent>
+                       <SelectItem value="Original">Original Image</SelectItem>
+                       <SelectItem value="Auto">Auto</SelectItem>
                       <SelectItem value="Attention">Attention</SelectItem>
                       <SelectItem value="Segmentation">Segmentation</SelectItem>
                       <SelectItem value="Injection">Injection</SelectItem>

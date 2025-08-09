@@ -294,6 +294,37 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] SAM-click error", e)
                 return self._send(500, {"error": str(e)})
 
+        if endpoint == "sam_multi_click":
+            try:
+                image_path = ensure_image_path(payload)
+                pts = payload.get("points", [])
+                blur_strength = int(payload.get("blur_strength", 15))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path", "received_keys": list(payload.keys())})
+                if not isinstance(pts, list) or len(pts) == 0:
+                    return self._send(400, {"error": "points must be a non-empty list"})
+                pil = Image.open(image_path).convert("RGB")
+                image_np = np.array(pil)
+                DETECTOR.sam_predictor.set_image(image_np)
+                point_coords = np.array([[int(p.get("x", 0)), int(p.get("y", 0))] for p in pts], dtype=np.int32)
+                point_labels = np.ones((len(pts),), dtype=np.int32)
+                masks, _, _ = DETECTOR.sam_predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=False,
+                )
+                mask = masks.astype(np.float32)
+                if mask.ndim == 3:
+                    mask = mask[0]
+                masked = apply_blur_with_mask(pil, mask, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                bbox = mask_bbox(mask)
+                print("[ModelServer] SAM-multi-click done", {"bbox": bbox, "points": len(pts)})
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": bbox})
+            except Exception as e:
+                print("[ModelServer] SAM-multi-click error", e)
+                return self._send(500, {"error": str(e)})
+
         if endpoint == "segmentation":
             image_path = ensure_image_path(payload)
             query = payload.get("query", "object")

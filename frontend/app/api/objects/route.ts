@@ -64,11 +64,13 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PUT(req: NextRequest) {
-  // SAM click inference: expects { imageData, x, y, blurStrength }
+  // SAM click inference:
+  // - single: expects { imageData, x, y, blurStrength }
+  // - multi: expects { imageData, points: [{x,y}, ...], blurStrength }
   try {
-    const { imageData, x, y, blurStrength } = await req.json()
-    if (!imageData || typeof x !== "number" || typeof y !== "number") {
-      return NextResponse.json({ error: "Missing imageData or x/y" }, { status: 400 })
+    const { imageData, x, y, points, blurStrength } = await req.json()
+    if (!imageData) {
+      return NextResponse.json({ error: "Missing imageData" }, { status: 400 })
     }
     const base64 = imageData.replace(/^data:image\/[a-zA-Z]+;base64,/, "")
     const buf = Buffer.from(base64, "base64")
@@ -81,12 +83,27 @@ export async function PUT(req: NextRequest) {
     const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
     const baseUrl = OBJECTS_SERVER_URL || MODEL_SERVER_URL
     const b64click = buf.toString("base64")
-    const resp = await fetch(`${baseUrl}/sam_click`, {
+
+    // Decide between multi-click and single-click
+    const isMulti = Array.isArray(points) && points.length > 0
+    const endpoint = isMulti ? "sam_multi_click" : "sam_click"
+    const body: any = { image_data: `data:image/jpeg;base64,${b64click}`, blur_strength: blurStrength ?? 15 }
+    if (isMulti) {
+      body.points = points
+    } else {
+      if (typeof x !== "number" || typeof y !== "number") {
+        return NextResponse.json({ error: "Missing x/y for single click" }, { status: 400 })
+      }
+      body.x = x
+      body.y = y
+    }
+
+    const resp = await fetch(`${baseUrl}/${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image_data: `data:image/jpeg;base64,${b64click}`, x, y, blur_strength: blurStrength ?? 15 }),
+      body: JSON.stringify(body),
     })
-    if (!resp.ok) return NextResponse.json({ error: `SAM click failed ${resp.status}` }, { status: 500 })
+    if (!resp.ok) return NextResponse.json({ error: `SAM ${isMulti ? "multi-" : ""}click failed ${resp.status}` }, { status: 500 })
     const payload = await resp.json()
     if (payload.processedImageData) {
       return NextResponse.json({ processedImageData: payload.processedImageData, bbox: payload.bbox })

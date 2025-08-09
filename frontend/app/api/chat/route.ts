@@ -13,21 +13,18 @@ async function processImageForMode(processingMode: string, imageData: string, us
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages, processingMode, aiModel, imageData, processedImageData: processedFromClient, selection, useOriginalImage } = await req.json()
+    const { messages, processingMode, aiModel, imageData, processedImageData: processedFromClient, selection } = await req.json()
 
-    console.log("Received request:", { processingMode, aiModel, useOriginalImage, hasImage: !!imageData })
+    console.log("Received request:", { processingMode, aiModel, hasImage: !!imageData })
 
     let processedImageData = processedFromClient || imageData
     let refinedQuery = messages[messages.length - 1]?.content || ""
 
-    // Handle "Use Original Image" case
-    if (useOriginalImage && imageData) {
-      console.log("Processing original image mode - using user query directly...")
-      // Use the original image data and user query without any preprocessing
+    // Handle Original Image mode
+    if (processingMode === "Original" && imageData) {
       processedImageData = imageData
-      // Keep the original user query as is
-    } else if (!useOriginalImage && imageData) {
-      // Process image if not using original image
+    } else if (processingMode !== "Original" && imageData) {
+      // Process image if using other modes (frontend usually handles this)
       try {
         const processingResult = await processImageForMode(processingMode, imageData, refinedQuery)
         processedImageData = processingResult.processedImageData
@@ -59,11 +56,11 @@ export async function POST(req: NextRequest) {
         systemMessage += `Provide comprehensive analysis of the image, considering all visible elements and their relationships.`
     }
 
-    if (useOriginalImage) {
+    if (processingMode === "Original") {
       systemMessage += ` You are analyzing the original image without any processing applied. Provide a comprehensive analysis based on the user's question.`
     }
 
-    if (selection && !useOriginalImage) {
+    if (selection && processingMode !== "Original") {
       systemMessage += ` The user has made a ${selection.type} selection in the image. Pay special attention to the selected region.`
     }
 
