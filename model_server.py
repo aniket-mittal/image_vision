@@ -16,6 +16,17 @@ print("[ModelServer] CLIP model loaded")
 
 # Load Grounded SAM once (GroundingDINO + SAM)
 print("[ModelServer] Loading GroundedSAMDetector...")
+import sys
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+# Ensure local Grounded_Segment_Anything and its submodules are importable
+_GSA_DIR = os.path.join(_CUR_DIR, "Grounded_Segment_Anything")
+_GSA_DINO_DIR = os.path.join(_GSA_DIR, "GroundingDINO")
+_GSA_DINO_PKG_DIR = os.path.join(_GSA_DINO_DIR, "groundingdino")
+_GSA_SAM_DIR = os.path.join(_GSA_DIR, "segment_anything")
+for p in [_GSA_DIR, _GSA_DINO_DIR, _GSA_DINO_PKG_DIR, _GSA_SAM_DIR]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
 import numpy as np
 
