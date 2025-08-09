@@ -313,8 +313,7 @@ class Handler(BaseHTTPRequestHandler):
                 if masks:
                     combined = np.zeros((height, width), dtype=np.float32)
                     for m in masks:
-                        if m.ndim == 3 and m.shape[0] == 1:
-                            m = m[0]
+                        m = ensure_foreground_mask(m)
                         combined = np.maximum(combined, m)
             except Exception as e:
                 print("[ModelServer] Segmentation GroundedDINO error, will fallback to SAM auto:", e)
@@ -326,8 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"processedImageData": None, "objects": [], "note": "no objects"})
                 combined = np.zeros((height, width), dtype=np.float32)
                 for m, _bbox in objs:
-                    if m.ndim == 3 and m.shape[0] == 1:
-                        m = m[0]
+                    m = ensure_foreground_mask(m)
                     combined = np.maximum(combined, m)
 
             # Build final mask according to mode
