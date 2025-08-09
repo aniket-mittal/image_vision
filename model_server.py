@@ -305,6 +305,7 @@ class Handler(BaseHTTPRequestHandler):
             overlay_strength = _to_float(payload.get("overlay_strength", 1.0), 1.0)
             spatial_bias = payload.get("spatial_bias", None)  # left|right|top|bottom
             bbox_bias = payload.get("bbox_bias", None)  # [x1,y1,x2,y2] in absolute pixels or 0..1
+            bias_strength = _to_float(payload.get("bias_strength", 1.0), 1.0)
             output_dir = payload.get("output_dir", "temp_output")
 
             if not image_path or not os.path.exists(image_path):
@@ -336,19 +337,34 @@ class Handler(BaseHTTPRequestHandler):
                     import numpy as _np
                     h, w = am.shape[-2], am.shape[-1]
                     weight = _np.ones((h, w), dtype=_np.float32)
+                    # Sharpen attention before bias to increase contrast
+                    try:
+                        am = torch.pow(am, 1.5)
+                    except Exception:
+                        pass
                     if isinstance(spatial_bias, str):
                         if spatial_bias == "left":
-                            ramp = _np.linspace(2.0, 0.2, w).astype(_np.float32)
+                            ramp = _np.linspace(2.5, 0.1, w).astype(_np.float32)
                             weight *= ramp[None, :]
                         elif spatial_bias == "right":
-                            ramp = _np.linspace(0.2, 2.0, w).astype(_np.float32)
+                            ramp = _np.linspace(0.1, 2.5, w).astype(_np.float32)
                             weight *= ramp[None, :]
                         elif spatial_bias == "top":
-                            ramp = _np.linspace(2.0, 0.2, h).astype(_np.float32)
+                            ramp = _np.linspace(2.5, 0.1, h).astype(_np.float32)
                             weight *= ramp[:, None]
                         elif spatial_bias == "bottom":
-                            ramp = _np.linspace(0.2, 2.0, h).astype(_np.float32)
+                            ramp = _np.linspace(0.1, 2.5, h).astype(_np.float32)
                             weight *= ramp[:, None]
+                    # Synthesize half-plane bbox if not provided
+                    if bbox_bias is None and isinstance(spatial_bias, str):
+                        if spatial_bias == "left":
+                            bbox_bias = [0, 0, int(0.5 * w), h]
+                        elif spatial_bias == "right":
+                            bbox_bias = [int(0.5 * w), 0, w - 1, h]
+                        elif spatial_bias == "top":
+                            bbox_bias = [0, 0, w, int(0.5 * h)]
+                        elif spatial_bias == "bottom":
+                            bbox_bias = [0, int(0.5 * h), w, h - 1]
                     if bbox_bias is not None and isinstance(bbox_bias, (list, tuple)) and len(bbox_bias) == 4:
                         x1, y1, x2, y2 = bbox_bias
                         # Normalize if values in 0..1
@@ -360,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                         y2 = max(0, min(int(y2), h - 1))
                         if x2 < x1: x1, x2 = x2, x1
                         if y2 < y1: y1, y2 = y2, y1
-                        weight[y1:y2+1, x1:x2+1] *= 2.5
+                        weight[y1:y2+1, x1:x2+1] *= (2.0 + 1.5 * bias_strength)
                     # Apply and renormalize
                     am = am * torch.from_numpy(weight).to(am.device)
                     am = am / (am.max() + 1e-6)

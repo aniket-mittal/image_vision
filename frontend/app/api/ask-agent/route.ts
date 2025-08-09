@@ -49,7 +49,7 @@ async function runAttention(imagePath: string, query: string, p: any) {
   const r = await fetch(`${MODEL_SERVER_URL}/attention`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
   if (!r.ok) throw new Error(`attention ${r.status}: ${await r.text()}`)
   const data = await r.json()
-  return data.processedImageData as string
+  return data as { processedImageData: string; attention_bbox?: number[] }
 }
 
 async function runSegmentation(imagePath: string, query: string, p: any) {
@@ -239,7 +239,8 @@ export async function POST(req: NextRequest) {
           lastSuggestion = (lastSuggestion ? lastSuggestion + " | " : "") + `objects:${(seg as any).objects.length}`
         }
       } else {
-        processed = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        const attn = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
+        processed = attn.processedImageData
       }
 
       lastProcessed = processed
