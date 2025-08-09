@@ -32,6 +32,7 @@ import numpy as np
 import tempfile
 import time
 from segment_anything import SamAutomaticMaskGenerator
+import torch
 
 DETECTOR = GroundedSAMDetector()
 print("[ModelServer] GroundedSAMDetector loaded")
@@ -172,9 +173,15 @@ class Handler(BaseHTTPRequestHandler):
 
                 print("[ModelServer] Attention inference start", {"query": query, "layer_index": layer_index})
                 _imgs, attention_maps, token_maps = CLIP_GEN.generate_masks([image_path], [query], enhancement_control, smoothing_kernel)
-                # Normalize to tensors (not truth-tested directly to avoid PyTorch ambiguity)
-                am = attention_maps[0] if isinstance(attention_maps, (list, tuple)) else attention_maps
-                tm = token_maps[0] if isinstance(token_maps, (list, tuple)) else token_maps
+                # Select first sample robustly
+                def _first_map(x):
+                    if isinstance(x, (list, tuple)):
+                        return x[0]
+                    if torch.is_tensor(x):
+                        return x[0] if x.dim() == 3 else x
+                    return x
+                am = _first_map(attention_maps)
+                tm = _first_map(token_maps)
                 pil_image = Image.open(image_path).convert("RGB")
                 masked_image, _ = CLIP_GEN.create_masked_image(
                     pil_image,
