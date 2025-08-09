@@ -337,23 +337,21 @@ class Handler(BaseHTTPRequestHandler):
                     import numpy as _np
                     h, w = am.shape[-2], am.shape[-1]
                     weight = _np.ones((h, w), dtype=_np.float32)
-                    # Sharpen attention before bias to increase contrast
-                    try:
-                        am = torch.pow(am, 1.5)
-                    except Exception:
-                        pass
                     if isinstance(spatial_bias, str):
+                        # Use conservative ramps to avoid flattening maps: min 0.7, max 1.6 scaled by bias_strength
+                        max_gain = 1.0 + 0.6 * float(bias_strength)
+                        min_gain = max(0.7, 1.0 - 0.3 * float(bias_strength))
                         if spatial_bias == "left":
-                            ramp = _np.linspace(2.5, 0.1, w).astype(_np.float32)
+                            ramp = _np.linspace(max_gain, min_gain, w).astype(_np.float32)
                             weight *= ramp[None, :]
                         elif spatial_bias == "right":
-                            ramp = _np.linspace(0.1, 2.5, w).astype(_np.float32)
+                            ramp = _np.linspace(min_gain, max_gain, w).astype(_np.float32)
                             weight *= ramp[None, :]
                         elif spatial_bias == "top":
-                            ramp = _np.linspace(2.5, 0.1, h).astype(_np.float32)
+                            ramp = _np.linspace(max_gain, min_gain, h).astype(_np.float32)
                             weight *= ramp[:, None]
                         elif spatial_bias == "bottom":
-                            ramp = _np.linspace(0.1, 2.5, h).astype(_np.float32)
+                            ramp = _np.linspace(min_gain, max_gain, h).astype(_np.float32)
                             weight *= ramp[:, None]
                     # Synthesize half-plane bbox if not provided
                     if bbox_bias is None and isinstance(spatial_bias, str):
@@ -376,10 +374,22 @@ class Handler(BaseHTTPRequestHandler):
                         y2 = max(0, min(int(y2), h - 1))
                         if x2 < x1: x1, x2 = x2, x1
                         if y2 < y1: y1, y2 = y2, y1
-                        weight[y1:y2+1, x1:x2+1] *= (2.0 + 1.5 * bias_strength)
-                    # Apply and renormalize
-                    am = am * torch.from_numpy(weight).to(am.device)
-                    am = am / (am.max() + 1e-6)
+                        box_gain = 1.0 + 1.0 * float(bias_strength)
+                        weight[y1:y2+1, x1:x2+1] *= box_gain
+                    # Apply and renormalize with fallback if variance collapses
+                    am_orig = am
+                    am_biased = am * torch.from_numpy(weight).to(am.device)
+                    maxv = am_biased.max()
+                    if float(maxv) > 0:
+                        am_biased = am_biased / (maxv + 1e-6)
+                    try:
+                        # If variance too low, keep original map to avoid flat gray result
+                        if float(am_biased.var()) < 1e-5:
+                            am = am_orig
+                        else:
+                            am = am_biased
+                    except Exception:
+                        am = am_biased
                 except Exception as _e:
                     print("[ModelServer] spatial bias application failed:", _e)
                 masked_image, _ = CLIP_GEN.create_masked_image(

@@ -84,6 +84,9 @@ export default function AIImageAnalyzer() {
       // Clear previous overlay
       ctx.clearRect(0, 0, canvas.width, canvas.height)
 
+      // Skip if base image not ready
+      if (!imgEl.complete || imgEl.naturalWidth === 0 || imgEl.naturalHeight === 0) return
+
       const paths: { type: Tool; coordinates: number[] }[] = []
       if (committedSelections && committedSelections.length > 0) {
         for (const sel of committedSelections) {
@@ -191,6 +194,9 @@ export default function AIImageAnalyzer() {
       content: input,
     }
 
+    // Reset inline stream UI for a new question
+    setAgentEvents([])
+    setAgentStepImages([])
     setMessages((prev) => [...prev, userMessage])
     setInput("")
     setIsLoading(true)
@@ -200,7 +206,8 @@ export default function AIImageAnalyzer() {
       if (mode === "Ask" && processingMode !== "Original" && processingMode !== "Injection") {
         try {
           // Use agentic orchestrator for Blur modes
-          let endpoint = "/api/ask-agent"
+          // Switch to streaming endpoint so we can update UI per step
+          let endpoint = "/api/ask-agent-stream"
           const roiSelections = selections.filter((s) => s.type === "crop" || s.type === "lasso")
           const lastSelection = roiSelections.length > 0 ? roiSelections[roiSelections.length - 1] : null
           let seedImageData: string | null = null
@@ -249,45 +256,45 @@ export default function AIImageAnalyzer() {
               body: JSON.stringify(requestBody),
             })
 
-            if (processResponse.ok) {
-              const processResult = await processResponse.json()
-              console.log("Processing result:", processResult)
-              const finalImg = processResult?.final?.processedImageData || processResult.processedImageData
-              if (finalImg) setProcessedImage(finalImg)
-              // Append concise telemetry and collect step images
-              if (processResult?.steps && Array.isArray(processResult.steps)) {
-                const logs: string[] = []
-                const imgs: string[] = []
-                processResult.steps.forEach((s: any, idx: number) => {
-                  const parts = [] as string[]
-                  parts.push(`Step ${idx + 1}: ${s.technique} → "${s.refinedQuery}"`)
-                  if (s.params) parts.push(`params=${JSON.stringify(s.params)}`)
-                  if (s.rationale) parts.push(`note=${s.rationale}`)
-                  logs.push(parts.join(" | "))
-                  if (s.narrative) logs.push(s.narrative)
-                  if (s.processedImageData) imgs.push(s.processedImageData)
-                })
-                setAgentEvents((prev) => [...prev, ...logs])
-                if (imgs.length) setAgentStepImages((prev) => [...prev, ...imgs])
-                if (imgs.length) setProcessedImage(imgs[imgs.length - 1])
+            if (processResponse.ok && processResponse.body) {
+              const reader = processResponse.body.getReader()
+              const decoder = new TextDecoder()
+              let buffer = ""
+              while (true) {
+                const { value, done } = await reader.read()
+                if (done) break
+                buffer += decoder.decode(value, { stream: true })
+                let idx
+                while ((idx = buffer.indexOf("\n")) >= 0) {
+                  const line = buffer.slice(0, idx).trim()
+                  buffer = buffer.slice(idx + 1)
+                  if (!line) continue
+                  try {
+                    const evt = JSON.parse(line)
+                    if (evt.type === "plan") {
+                      // Only show the natural language line
+                      setAgentEvents((prev) => [...prev, evt.narrative || `Running ${evt.technique} to look for ${evt.refinedQuery}.`])
+                    } else if (evt.type === "image") {
+                      if (evt.processedImageData) {
+                        setAgentStepImages((prev) => [...prev, evt.processedImageData])
+                        setProcessedImage(evt.processedImageData)
+                      }
+                    } else if (evt.type === "verdict") {
+                      setAgentEvents((prev) => [...prev, `Verdict step ${evt.step}: score=${evt.score?.toFixed?.(2) ?? evt.score} good=${evt.good}`])
+                    } else if (evt.type === "final") {
+                      if (evt.final?.processedImageData) setProcessedImage(evt.final.processedImageData)
+                      const answer = evt.answer || ""
+                      setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), role: "assistant", content: answer }])
+                      setIsLoading(false)
+                      return
+                    }
+                  } catch {
+                    // ignore parse errors
+                  }
+                }
               }
-              
-                // If the processing API returned an answer, use it directly
-              if (processResult.answer) {
-                console.log("Using answer from processing API:", processResult.answer.substring(0, 100) + "...")
-                setMessages((prev) => [
-                  ...prev,
-                  {
-                    id: (Date.now() + 1).toString(),
-                    role: "assistant",
-                    content: processResult.answer,
-                  },
-                ])
-                setIsLoading(false)
-                return // Skip the chat API call since we already have the answer
-              } else {
-                console.log("No answer from processing API, proceeding to chat API")
-              }
+              // If stream ends without final, stop loading to avoid spinner lock
+              setIsLoading(false)
             } else {
               console.error("Processing API failed:", processResponse.status, await processResponse.text())
             }
@@ -390,11 +397,14 @@ export default function AIImageAnalyzer() {
       const reader = new FileReader()
       reader.onload = (e) => {
         setUploadedImage(e.target?.result as string)
+        setProcessedImage(null)
         setSelections([])
         setDetectedObjects([])
         setSelectedObjectIds([])
         setSelectedObjectPoints([])
         setHasAutoHighlighted(false)
+        setAgentEvents([])
+        setAgentStepImages([])
       }
       reader.readAsDataURL(file)
     }
