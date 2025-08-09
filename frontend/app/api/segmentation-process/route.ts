@@ -159,11 +159,13 @@ Respond in JSON format:
 }
 
 async function runSegmentationMasking(imagePath: string, query: string, parameters: any): Promise<{ processedImageData?: string; savedPath?: string; backend: "model-server" }> {
-  // Call model server only
+  // Call model server only; send only image_data to avoid invalid local paths on remote servers
   const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
+  const imageDataUrl = await import("fs/promises").then((fs) =>
+    fs.readFile(imagePath).then((b) => `data:image/jpeg;base64,${b.toString("base64")}`)
+  )
   const requestBody = {
-    image_path: imagePath,
-    image_data: await import("fs/promises").then(fs => fs.readFile(imagePath).then(b=>`data:image/jpeg;base64,${b.toString("base64")}`)),
+    image_data: imageDataUrl,
     query,
     blur_strength: parameters.blur_strength ?? 15,
     padding: parameters.padding ?? 20,

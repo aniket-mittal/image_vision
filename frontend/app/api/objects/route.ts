@@ -26,8 +26,8 @@ async function detectAllObjects(imagePath: string, prompt = "object", imageBase6
     const resp = await fetch(`${baseUrl}/detect_all`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-      // send both path and data URL to support remote servers that cannot read local temp paths
-      body: JSON.stringify({ image_path: imagePath, image_data: b64 ? `data:image/jpeg;base64,${b64}` : undefined, prompt }),
+      // send only image_data to support remote servers that cannot read local temp paths
+      body: JSON.stringify({ image_data: b64 ? `data:image/jpeg;base64,${b64}` : undefined, prompt }),
   })
   if (!resp.ok) throw new Error(`detect_all failed ${resp.status}`)
   return resp.json()
@@ -84,7 +84,7 @@ export async function PUT(req: NextRequest) {
     const resp = await fetch(`${baseUrl}/sam_click`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image_path: imagePath, image_data: `data:image/jpeg;base64,${b64click}` , x, y, blur_strength: blurStrength ?? 15 }),
+      body: JSON.stringify({ image_data: `data:image/jpeg;base64,${b64click}`, x, y, blur_strength: blurStrength ?? 15 }),
     })
     if (!resp.ok) return NextResponse.json({ error: `SAM click failed ${resp.status}` }, { status: 500 })
     const payload = await resp.json()

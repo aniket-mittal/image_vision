@@ -39,6 +39,7 @@ export default function AIImageAnalyzer() {
   const [isDrawing, setIsDrawing] = useState(false)
   const [drawPath, setDrawPath] = useState<number[]>([])
   const [isDetectingObjects, setIsDetectingObjects] = useState(false)
+  const [hasAutoHighlighted, setHasAutoHighlighted] = useState(false)
 
   // Custom chat state
   const [messages, setMessages] = useState<Message[]>([])
@@ -347,6 +348,7 @@ export default function AIImageAnalyzer() {
         setSelections([])
         setDetectedObjects([])
         setSelectedObjectId(null)
+        setHasAutoHighlighted(false)
       }
       reader.readAsDataURL(file)
     }
@@ -470,23 +472,22 @@ export default function AIImageAnalyzer() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ imageData: uploadedImage, x: origX, y: origY, blurStrength: 15 }),
     })
-    if (res.ok) {
-      const data = await res.json()
-      setProcessedImage(data.processedImageData)
-      // Update overlay to match returned bbox (scale to display)
-      if (data.bbox && imageNaturalSize && imageRef.current) {
-        const [bx1, by1, bx2, by2] = data.bbox as number[]
-        const scaleX2 = imageRef.current.offsetWidth / imageNaturalSize.w
-        const scaleY2 = imageRef.current.offsetHeight / imageNaturalSize.h
-        const sel: Selection = {
-          type: "object-selector",
-          coordinates: [bx1 * scaleX2, by1 * scaleY2, bx2 * scaleX2, by2 * scaleY2],
-          imageData: uploadedImage,
-        }
-        setSelections([sel])
-        drawHighlightOverlay([sel])
-        console.log("[ObjectSelector] SAM-click inference done")
+    if (!res.ok) return
+    const data = await res.json()
+    if (!data.processedImageData || !data.bbox) return
+    setProcessedImage(data.processedImageData)
+    if (imageNaturalSize && imageRef.current) {
+      const [bx1, by1, bx2, by2] = data.bbox as number[]
+      const scaleX2 = imageRef.current.offsetWidth / imageNaturalSize.w
+      const scaleY2 = imageRef.current.offsetHeight / imageNaturalSize.h
+      const sel: Selection = {
+        type: "object-selector",
+        coordinates: [bx1 * scaleX2, by1 * scaleY2, bx2 * scaleX2, by2 * scaleY2],
+        imageData: uploadedImage,
       }
+      setSelections([sel])
+      drawHighlightOverlay([sel])
+      console.log("[ObjectSelector] SAM-click inference done")
     }
   }, [uploadedImage, imageNaturalSize, drawHighlightOverlay])
 
@@ -522,14 +523,15 @@ export default function AIImageAnalyzer() {
         if (res.ok) {
           const data = await res.json()
           setDetectedObjects(data.objects || [])
-          // Auto-select first object to highlight and pre-blur background
-          if ((data.objects || []).length > 0 && imageRef.current && imageNaturalSize) {
+          // Auto-highlight first object once per image
+          if (!hasAutoHighlighted && (data.objects || []).length > 0 && imageRef.current && imageNaturalSize) {
             const first = data.objects[0]
-            // Compute click point at object center in original image coords
             const [x1, y1, x2, y2] = first.bbox as number[]
             const cx = Math.round((x1 + x2) / 2)
             const cy = Math.round((y1 + y2) / 2)
-            await runSamClickAt(cx, cy)
+            // Fire and forget; do not await to avoid blocking state updates
+            runSamClickAt(cx, cy).catch(() => {})
+            setHasAutoHighlighted(true)
           }
         }
       } catch (_) {}
@@ -538,7 +540,7 @@ export default function AIImageAnalyzer() {
       }
     }
     detect()
-  }, [uploadedImage, imageNaturalSize, runSamClickAt])
+  }, [uploadedImage])
 
   return (
     <div className="flex h-screen bg-gray-50">

@@ -161,10 +161,12 @@ Respond in JSON format:
 }
 
 async function runAttentionMasking(imagePath: string, query: string, parameters: any): Promise<{ savedPath?: string; processedImageData?: string; backend: "model-server" }> {
-  // Only call the model server; no local fallbacks
+  // Only call the model server; send only image_data to avoid invalid local paths on remote servers
+  const imageDataUrl = await import("fs/promises").then((fs) =>
+    fs.readFile(imagePath).then((b) => `data:image/jpeg;base64,${b.toString("base64")}`)
+  )
   const requestBody = {
-    image_path: imagePath,
-    image_data: await import("fs/promises").then(fs => fs.readFile(imagePath).then(b=>`data:image/jpeg;base64,${b.toString("base64")}`)),
+    image_data: imageDataUrl,
     query,
     layer_index: parameters.layer_index ?? 23,
     enhancement_control: parameters.enhancement_control ?? 5.0,
