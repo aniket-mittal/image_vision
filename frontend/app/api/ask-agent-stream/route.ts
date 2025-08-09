@@ -179,9 +179,12 @@ export async function POST(req: NextRequest) {
             if (Array.isArray(seg.objects) && seg.objects.length) {
               lastSuggestion = (lastSuggestion ? lastSuggestion + " | " : "") + `objects:${seg.objects.length}`
             }
+            // Emit object coords for LLM awareness
+            send({ type: "coords", step: i + 1, objects: seg.objects || [] })
           } else {
             const attn = await runAttention(imagePath, plan.refinedQuery || userQuery, plan.params || {})
             processed = attn.processedImageData
+            if (attn.attention_bbox) send({ type: "coords", step: i + 1, attention_bbox: attn.attention_bbox })
           }
           lastProcessed = processed
           lastTechnique = plan.technique
@@ -189,7 +192,7 @@ export async function POST(req: NextRequest) {
           send({ type: "image", step: i + 1, technique: plan.technique, refinedQuery: plan.refinedQuery, processedImageData: processed })
 
           // Verify
-          const sysVerifier = { role: "system", content: "You are a vision verifier. Return JSON {\"score\":0..1,\"good\":true|false,\"suggestion\":\"...\"}." }
+          const sysVerifier = { role: "system", content: "You are a vision verifier. Return JSON {\"score\":0..1,\"good\":true|false,\"suggestion\":\"...\",\"narrative\":\"one short reason for next action\"}." }
           const verifierUser = { role: "user", content: [
             { type: "text", text: `Question: ${userQuery}\nOCR: ${ocr?.text || "<none>"}\nOCR Layout: ${ocrSummary}\nCurrent technique: ${plan.technique}\nRefined query: ${plan.refinedQuery}\nParams: ${JSON.stringify(plan.params)}${lastSuggestion ? "\nNotes: "+lastSuggestion : ""}` },
             { type: "image_url", image_url: { url: processed } },
@@ -201,7 +204,7 @@ export async function POST(req: NextRequest) {
             verdict = JSON.parse(content)
           } catch {}
           lastSuggestion = verdict.suggestion || null
-          send({ type: "verdict", step: i + 1, score: verdict.score, good: verdict.good, suggestion: verdict.suggestion })
+          send({ type: "verdict", step: i + 1, score: verdict.score, good: verdict.good, suggestion: verdict.suggestion, narrative: verdict.narrative })
           if (verdict.good && verdict.score >= 0.8) break
         }
 

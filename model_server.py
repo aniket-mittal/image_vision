@@ -160,6 +160,22 @@ def rect_mask(width: int, height: int, x1: int, y1: int, x2: int, y2: int):
     m[y1:y2+1, x1:x2+1] = 1.0
     return m
 
+def oval_mask_from_bbox(width: int, height: int, x1: int, y1: int, x2: int, y2: int):
+    import cv2
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(0, min(x2, width - 1))
+    y2 = max(0, min(y2, height - 1))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+    axes = (max(1, int((x2 - x1) / 2)), max(1, int((y2 - y1) / 2)))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
+    return mask.astype(np.float32)
+
 def np_to_jpeg_base64(img: Image.Image) -> str:
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=90)
@@ -659,6 +675,38 @@ class Handler(BaseHTTPRequestHandler):
             b64 = np_to_jpeg_base64(masked)
             print("[ModelServer] Segmentation done")
             return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "objects": out_objects})
+
+        if endpoint == "blur_box":
+            try:
+                image_path = ensure_image_path(payload)
+                x1 = int(payload.get("x1", 0)); y1 = int(payload.get("y1", 0)); x2 = int(payload.get("x2", 0)); y2 = int(payload.get("y2", 0))
+                blur_strength = int(payload.get("blur_strength", 15))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                w, h = pil.size
+                m = rect_mask(w, h, x1, y1, x2, y2)
+                masked = apply_blur_with_mask(pil, m, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": [x1,y1,x2,y2]})
+            except Exception as e:
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "blur_oval":
+            try:
+                image_path = ensure_image_path(payload)
+                x1 = int(payload.get("x1", 0)); y1 = int(payload.get("y1", 0)); x2 = int(payload.get("x2", 0)); y2 = int(payload.get("y2", 0))
+                blur_strength = int(payload.get("blur_strength", 15))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                w, h = pil.size
+                m = oval_mask_from_bbox(w, h, x1, y1, x2, y2)
+                masked = apply_blur_with_mask(pil, m, blur_strength)
+                b64 = np_to_jpeg_base64(masked)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": [x1,y1,x2,y2]})
+            except Exception as e:
+                return self._send(500, {"error": str(e)})
 
         return self._send(404, {"error": "not found"})
 

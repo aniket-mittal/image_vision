@@ -279,12 +279,25 @@ export default function AIImageAnalyzer() {
                         setAgentStepImages((prev) => [...prev, evt.processedImageData])
                         setProcessedImage(evt.processedImageData)
                       }
+                    } else if (evt.type === "coords") {
+                      // Append a brief hint so users know the agent is using coordinates
+                      if (evt.attention_bbox) {
+                        setAgentEvents((prev) => [...prev, `Got attention bbox ${JSON.stringify(evt.attention_bbox)}`])
+                      } else if (Array.isArray(evt.objects) && evt.objects.length) {
+                        setAgentEvents((prev) => [...prev, `Detected ${evt.objects.length} object regions`])
+                      }
                     } else if (evt.type === "verdict") {
-                      setAgentEvents((prev) => [...prev, `Verdict step ${evt.step}: score=${evt.score?.toFixed?.(2) ?? evt.score} good=${evt.good}`])
+                      const scoreTxt = (typeof evt.score === "number" && evt.score.toFixed) ? evt.score.toFixed(2) : evt.score
+                      const line = evt.narrative ? evt.narrative : `Continuing analysis to improve clarity/relevance.`
+                      setAgentEvents((prev) => [...prev, `Verdict step ${evt.step}: score=${scoreTxt} good=${evt.good}`, line])
                     } else if (evt.type === "final") {
                       if (evt.final?.processedImageData) setProcessedImage(evt.final.processedImageData)
                       const answer = evt.answer || ""
                       setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), role: "assistant", content: answer }])
+                      // After ~2s, revert the view back to the original image
+                      setTimeout(() => {
+                        setProcessedImage(null)
+                      }, 2000)
                       setIsLoading(false)
                       return
                     }
