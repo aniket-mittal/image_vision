@@ -1324,9 +1324,31 @@ class Handler(BaseHTTPRequestHandler):
                 if not mask_png:
                     return self._send(400, {"error": "mask_png required (data URL)"})
 
-                # Use preloaded models
+                # Use preloaded models or load on-demand
                 if _DIFFUSERS_ENV["pipe_sdxl"] is None:
-                    return self._send(500, {"error": "SDXL model not preloaded"})
+                    print("[ModelServer] SDXL not preloaded, loading on-demand...")
+                    try:
+                        from diffusers import StableDiffusionXLInpaintPipeline
+                        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+                        
+                        # Load SDXL Inpainting
+                        base = "stabilityai/stable-diffusion-xl-base-1.0"
+                        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+                            base, 
+                            torch_dtype=torch.float16 if device == "cuda" else torch.float32
+                        )
+                        pipe = pipe.to(device)
+                        pipe.enable_attention_slicing()
+                        if device == "cuda":
+                            try:
+                                pipe.enable_xformers_memory_efficient_attention()
+                            except Exception:
+                                pass
+                        _DIFFUSERS_ENV["pipe_sdxl"] = pipe
+                        print("[ModelServer] SDXL loaded on-demand")
+                    except Exception as e:
+                        print(f"[ModelServer] SDXL on-demand loading failed: {e}")
+                        return self._send(500, {"error": f"Failed to load SDXL model: {e}"})
 
                 pipe = _DIFFUSERS_ENV["pipe_sdxl"]
                 device = next(pipe.parameters()).device
@@ -1344,30 +1366,59 @@ class Handler(BaseHTTPRequestHandler):
                 # Build ControlNet conditions
                 control_images = []
                 control_nets = []
-                if use_canny and _DIFFUSERS_ENV["controlnet_canny"] is not None:
-                    arr = np.array(pil)
-                    edges = cv2.Canny(arr, 100, 200)
-                    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-                    control_images.append(Image.fromarray(edges_rgb))
-                    control_nets.append(_DIFFUSERS_ENV["controlnet_canny"])
+                
+                # Lazy load Canny ControlNet if needed
+                if use_canny:
+                    if _DIFFUSERS_ENV["controlnet_canny"] is None:
+                        try:
+                            from diffusers import ControlNetModel
+                            device = next(pipe.parameters()).device
+                            _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained(
+                                "diffusers/controlnet-canny-sdxl-1.0"
+                            ).to(device)
+                            print("[ModelServer] ControlNet Canny loaded on-demand")
+                        except Exception as e:
+                            print(f"[ModelServer] ControlNet Canny on-demand loading failed: {e}")
+                            use_canny = False
                     
-                if use_depth and _DIFFUSERS_ENV["controlnet_depth"] is not None:
-                    try:
-                        # Try MiDaS small via torch.hub as a lightweight depth
-                        midas = torch.hub.load("intel-isl/MiDaS", "DPT_Small")
-                        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-                        transform = midas_transforms.small_transform
-                        midas = midas.to(device).eval()
-                        inp = transform(pil).to(device)
-                        with torch.no_grad():
-                            pred = midas(inp).squeeze().detach().cpu().numpy()
-                        pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-6)
-                        depth = (pred * 255).astype(np.uint8)
-                        depth_rgb = cv2.cvtColor(depth, cv2.COLOR_GRAY2RGB)
-                        control_images.append(Image.fromarray(depth_rgb))
-                        control_nets.append(_DIFFUSERS_ENV["controlnet_depth"])
-                    except Exception as _e:
-                        print("[ModelServer] Depth map unavailable:", _e)
+                    if _DIFFUSERS_ENV["controlnet_canny"] is not None:
+                        arr = np.array(pil)
+                        edges = cv2.Canny(arr, 100, 200)
+                        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+                        control_images.append(Image.fromarray(edges_rgb))
+                        control_nets.append(_DIFFUSERS_ENV["controlnet_canny"])
+                    
+                # Lazy load Depth ControlNet if needed
+                if use_depth:
+                    if _DIFFUSERS_ENV["controlnet_depth"] is None:
+                        try:
+                            from diffusers import ControlNetModel
+                            device = next(pipe.parameters()).device
+                            _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained(
+                                "diffusers/controlnet-depth-sdxl-1.0"
+                            ).to(device)
+                            print("[ModelServer] ControlNet Depth loaded on-demand")
+                        except Exception as e:
+                            print(f"[ModelServer] ControlNet Depth on-demand loading failed: {e}")
+                            use_depth = False
+                    
+                    if _DIFFUSERS_ENV["controlnet_depth"] is not None:
+                        try:
+                            # Try MiDaS small via torch.hub as a lightweight depth
+                            midas = torch.hub.load("intel-isl/MiDaS", "DPT_Small")
+                            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+                            transform = midas_transforms.small_transform
+                            midas = midas.to(device).eval()
+                            inp = transform(pil).to(device)
+                            with torch.no_grad():
+                                pred = midas(inp).squeeze().detach().cpu().numpy()
+                            pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-6)
+                            depth = (pred * 255).astype(np.uint8)
+                            depth_rgb = cv2.cvtColor(depth, cv2.COLOR_GRAY2RGB)
+                            control_images.append(Image.fromarray(depth_rgb))
+                            control_nets.append(_DIFFUSERS_ENV["controlnet_depth"])
+                        except Exception as _e:
+                            print("[ModelServer] Depth map unavailable:", _e)
 
                 generator = torch.Generator(device=device)
                 if seed > 0:
@@ -1489,6 +1540,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run():
+    # Call preload functions before starting server
+    print("[ModelServer] Starting model preloading...")
+    try:
+        preload_diffusion_models()
+        preload_lama()
+        print("[ModelServer] Model preloading completed")
+    except Exception as e:
+        print(f"[ModelServer] Error during model preloading: {e}")
+        print("[ModelServer] Continuing with lazy loading...")
+    
     port = int(os.environ.get("MODEL_SERVER_PORT", "8765"))
     host = os.environ.get("MODEL_SERVER_HOST", "127.0.0.1")
     server = HTTPServer((host, port), Handler)
