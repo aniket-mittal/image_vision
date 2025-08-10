@@ -1514,9 +1514,9 @@ class Handler(BaseHTTPRequestHandler):
                 out = gen.images[0]
                 b64 = np_to_jpeg_base64(out)
                 return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
-            except Exception as e:
-                print("[ModelServer] inpaint_sdxl error:", e)
-                return self._send(500, {"error": str(e)})
+        except Exception as e:
+            print("[ModelServer] inpaint_sdxl error:", e)
+            return self._send(500, {"error": str(e)})
                 
     def _inpaint_fallback_handler(self, payload):
         """Handle fallback inpainting when SDXL fails"""
