@@ -259,20 +259,44 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       throw new Error("No image data in response");
     }
 
-    // Post-process to restore original aspect ratio
+    // Post-process: restore original aspect ratio and composite with original using mask
     if (imageMetadata.width && imageMetadata.height) {
       const originalAspectRatio = imageMetadata.width / imageMetadata.height;
       const targetWidth = 1024;
       const targetHeight = Math.round(targetWidth / originalAspectRatio);
       
-      // Resize the generated image to maintain aspect ratio
-      const resizedBuffer = await sharp(Buffer.from(processedImageData.split(',')[1], 'base64'))
+      const genBuf = Buffer.from(processedImageData.split(',')[1], 'base64');
+      const genResized = await sharp(genBuf)
         .resize(targetWidth, targetHeight, { fit: 'fill' })
+        .toBuffer();
+
+      // Resize mask to original aspect ratio dimensions and prepare as 8-bit alpha
+      const maskAlpha = await sharp(maskBuffer)
+        .resize(targetWidth, targetHeight, { fit: 'fill' })
+        .threshold(128)
+        .toColourspace('b-w')
+        .ensureAlpha() // guarantees an alpha channel exists
+        .removeAlpha() // keep single channel grayscale
+        .toBuffer();
+
+      // Build RGBA for generated image using mask as alpha
+      const genRGBA = await sharp(genResized)
+        .joinChannel(maskAlpha) // maskAlpha used as alpha channel
         .png()
         .toBuffer();
-      
-      processedImageData = `data:image/png;base64,${resizedBuffer.toString('base64')}`;
-      console.log(`Resized image to ${targetWidth}x${targetHeight} to maintain aspect ratio`);
+
+      // Composite: gen over original using alpha so only masked region is replaced
+      const originalResized = await sharp(imageBuffer)
+        .resize(targetWidth, targetHeight, { fit: 'fill' })
+        .toBuffer();
+
+      const finalComposite = await sharp(originalResized)
+        .composite([{ input: genRGBA, blend: 'over' }])
+        .png()
+        .toBuffer();
+
+      processedImageData = `data:image/png;base64,${finalComposite.toString('base64')}`;
+      console.log(`Composited generated content into masked region at ${targetWidth}x${targetHeight}`);
     }
 
     console.log(`OpenAI edit successful, result size: ${processedImageData.length} chars`);

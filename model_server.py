@@ -1078,35 +1078,33 @@ class Handler(BaseHTTPRequestHandler):
                             
                             # Scale image and trimap
                             image_scaled = scale_input(np.array(pil).astype(np.float32) / 255.0)
-                            trimap_scaled = scale_input(trimap_2ch)
+                            trimap_scaled = scale_input(trimap_2ch.astype(np.float32))
                             
-                            # Convert to tensors
-                            from torchvision import transforms as T
-                            to_tensor = T.ToTensor()
-                            img_t = to_tensor(image_scaled).unsqueeze(0)
-                            trimap_t = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0)
-                            
-                            # Apply FBA transformations - create tensors directly on the correct device
+                            # Build tensors exactly like demo.py (np_to_torch) on CUDA if available
                             device = next(net.parameters()).device
                             model_dtype = next(net.parameters()).dtype
-                            
-                            # Create tensors directly on the correct device
-                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device=device, dtype=model_dtype)
-                            image_transformed = normalise_image(img_t.clone()).to(device=device, dtype=model_dtype)
-                            
-                            # Move input tensors to device
-                            img_t = img_t.to(device=device, dtype=model_dtype)
-                            trimap_t = trimap_t.to(device=device, dtype=model_dtype)
+
+                            def np_to_torch(x: np.ndarray, permute: bool) -> torch.Tensor:
+                                t = torch.from_numpy(x)
+                                if permute:
+                                    t = t.permute(2, 0, 1)
+                                return t.unsqueeze(0).to(device=device, dtype=model_dtype)
+
+                            img_t = np_to_torch(image_scaled, permute=True)
+                            trimap_t = np_to_torch(trimap_scaled, permute=True)
+
+                            trimap_transformed_torch = np_to_torch(trimap_transform(trimap_scaled), permute=False)
+                            image_transformed_torch = normalise_image(img_t.clone()).to(device=device, dtype=model_dtype)
                             
                             # Double-check all tensors are on the same device
                             try:
                                 assert img_t.device == device, f"Image tensor on {img_t.device}, expected {device}"
                                 assert trimap_t.device == device, f"Trimap tensor on {trimap_t.device}, expected {device}"
-                                assert trimap_transformed.device == device, f"Trimap transformed on {trimap_transformed.device}, expected {device}"
-                                assert image_transformed.device == device, f"Image transformed on {image_transformed.device}, expected {device}"
+                                assert trimap_transformed_torch.device == device, f"Trimap transformed on {trimap_transformed_torch.device}, expected {device}"
+                                assert image_transformed_torch.device == device, f"Image transformed on {image_transformed_torch.device}, expected {device}"
                                 
                                 print(f"[ModelServer] All tensors moved to device: {device}")
-                                print(f"[ModelServer] Tensor devices - img_t: {img_t.device}, trimap_t: {trimap_t.device}, trimap_transformed: {trimap_transformed.device}, image_transformed: {image_transformed.device}")
+                                print(f"[ModelServer] Tensor devices - img_t: {img_t.device}, trimap_t: {trimap_t.device}, trimap_transformed: {trimap_transformed_torch.device}, image_transformed: {image_transformed_torch.device}")
                             except AssertionError as device_error:
                                 print(f"[ModelServer] Device mismatch detected: {device_error}")
                                 print("[ModelServer] Attempting to fix device mismatch...")
@@ -1114,14 +1112,19 @@ class Handler(BaseHTTPRequestHandler):
                                 # Force move all tensors to the correct device
                                 img_t = img_t.to(device)
                                 trimap_t = trimap_t.to(device)
-                                trimap_transformed = trimap_transformed.to(device)
-                                image_transformed = image_transformed.to(device)
+                                trimap_transformed_torch = trimap_transformed_torch.to(device)
+                                image_transformed_torch = image_transformed_torch.to(device)
                                 
                                 print(f"[ModelServer] Forced device correction - all tensors now on {device}")
                             
+                            # Ensure model itself is on correct device as well
+                            try:
+                                net = net.to(device)
+                            except Exception:
+                                pass
                             # Call FBA with correct 4 arguments
                             with torch.no_grad():
-                                output = net(img_t, trimap_t, image_transformed, trimap_transformed)
+                                output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
                                 
                                 # Extract alpha channel and resize back to original size
                                 if isinstance(output, (list, tuple)):
@@ -1662,7 +1665,14 @@ class Handler(BaseHTTPRequestHandler):
                         generator=generator,
                     )
                 out = gen.images[0]
-                b64 = np_to_jpeg_base64(out)
+                # Composite: keep original outside mask for precision
+                out_np = np.array(out)
+                orig_np = np.array(pil)
+                mask_np = np.array(mask)
+                mask_bin = (mask_np > 127).astype(np.uint8)
+                comp_np = np.where(mask_bin[..., None] == 1, out_np, orig_np)
+                comp_img = Image.fromarray(comp_np)
+                b64 = np_to_jpeg_base64(comp_img)
                 return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
         except Exception as e:
             print("[ModelServer] inpaint_sdxl error:", e)
