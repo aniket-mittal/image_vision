@@ -218,8 +218,8 @@ def ensure_fba_loaded(device: str = None):
         # Strategy 1: Try importing from networks.models (actual structure from demo.py)
         try:
             # Add the repository root to sys.path first
-                    if repo not in sys.path:
-                        sys.path.insert(0, repo)
+            if repo not in sys.path:
+                sys.path.insert(0, repo)
             from networks.models import build_model  # type: ignore
             fba_module = build_model
             print("[ModelServer] FBA imported successfully from networks.models (build_model)")
@@ -1123,25 +1123,20 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                             # Call FBA with correct 4 arguments
-                        with torch.no_grad():
+                            with torch.no_grad():
                                 output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
-                                
                                 # Extract alpha channel and resize back to original size
                                 if isinstance(output, (list, tuple)):
                                     output = output[0]
-                                
                                 # FBA returns [alpha, fg, bg] - we want alpha
                                 alpha_scaled = output[0, 0].cpu().numpy()
-                                
                                 # Resize back to original dimensions
                                 alpha = cv2.resize(alpha_scaled, (W, H), interpolation=cv2.INTER_LANCZOS4)
-                            refined = np.clip(alpha, 0.0, 1.0)
-                                
-                                print("[ModelServer] FBA refine successful using correct 4-argument API")
-                                
-                    except Exception as _e:
-                        print("[ModelServer] FBA refine failed, will fallback:", _e)
-                        refined = None
+                                refined = np.clip(alpha, 0.0, 1.0)
+                            print("[ModelServer] FBA refine successful using correct 4-argument API")
+                        except Exception as _e:
+                            print("[ModelServer] FBA refine failed, will fallback:", _e)
+                            refined = None
                 if refined is None:
                     # Fallback: edge-aware feather using distance transform
                     import cv2
@@ -1665,9 +1660,12 @@ class Handler(BaseHTTPRequestHandler):
                         generator=generator,
                     )
                 out = gen.images[0]
-                # Ensure generated image matches original size
-                if out.size != (W, H):
-                    out = out.resize((W, H), Image.LANCZOS)
+                # Ensure generated image matches original size before compositing
+                try:
+                    if out.size != (W, H):
+                        out = out.resize((W, H), Image.LANCZOS)
+                except Exception:
+                    pass
                 # Composite: keep original outside mask for precision
                 out_np = np.array(out)
                 orig_np = np.array(pil)
