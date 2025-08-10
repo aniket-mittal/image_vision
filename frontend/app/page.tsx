@@ -364,69 +364,77 @@ export default function AIImageAnalyzer() {
         if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
       }
 
-      console.log("Calling chat API (processedImage present?):", !!processedImage)
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-          body: JSON.stringify({
-          messages: [...messages, userMessage],
-          processingMode,
-          aiModel,
-          imageData: uploadedImage,
-          processedImageData: processedImage,
-            // For chat context, include the most recent ROI selection if any
-            selection: (selections.filter((s) => s.type === "crop" || s.type === "lasso").slice(-1)[0] ?? null),
-        }),
-      })
+      // Only call chat API for Ask mode, not for Edit mode
+      if (mode === "Ask") {
+        console.log("Calling chat API (processedImage present?):", !!processedImage)
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+            body: JSON.stringify({
+            messages: [...messages, userMessage],
+            processingMode,
+            aiModel,
+            imageData: uploadedImage,
+            processedImageData: processedImage,
+              // For chat context, include the most recent ROI selection if any
+              selection: (selections.filter((s) => s.type === "crop" || s.type === "lasso").slice(-1)[0] ?? null),
+          }),
+        })
 
-      if (!response.ok) {
-        throw new Error("Failed to get response")
-      }
+        if (!response.ok) {
+          throw new Error("Failed to get response")
+        }
 
-      const reader = response.body?.getReader()
-      if (!reader) {
-        throw new Error("No response body")
-      }
+        const reader = response.body?.getReader()
+        if (!reader) {
+          throw new Error("No response body")
+        }
 
-      let assistantMessage = ""
-      const assistantMessageId = (Date.now() + 1).toString()
+        let assistantMessage = ""
+        const assistantMessageId = (Date.now() + 1).toString()
 
-      // Add empty assistant message that we'll update
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: assistantMessageId,
-          role: "assistant",
-          content: "",
-        },
-      ])
+        // Add empty assistant message that we'll update
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            content: "",
+          },
+        ])
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
 
-        const chunk = new TextDecoder().decode(value)
-        const lines = chunk.split("\n")
+          const chunk = new TextDecoder().decode(value)
+          const lines = chunk.split("\n")
 
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6))
-              if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
-                assistantMessage += data.choices[0].delta.content
-                setMessages((prev) =>
-                  prev.map((msg) => (msg.id === assistantMessageId ? { ...msg, content: assistantMessage } : msg)),
-                )
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
+                  assistantMessage += data.choices[0].delta.content
+                  setMessages((prev) =>
+                    prev.map((msg) => (msg.id === assistantMessageId ? { ...msg, content: assistantMessage } : msg)),
+                  )
+                }
+              } catch (e) {
+                // Ignore parsing errors
               }
-            } catch (e) {
-              // Ignore parsing errors
             }
           }
+          
+          console.log("Processed chunk, current assistant message length:", assistantMessage.length)
         }
         
-        console.log("Processed chunk, current assistant message length:", assistantMessage.length)
+        // After chat response is complete, revert to original image after ~1 second
+        setTimeout(() => {
+          setProcessedImage(null)
+        }, 1000)
       }
     } catch (error) {
       console.error("Error:", error)

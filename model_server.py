@@ -5,43 +5,52 @@ import base64
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
+import sys
+import time
+
+# Global imports - ensure these are available everywhere
+import torch
+import numpy as np
+from PIL import Image
+import cv2
 
 # Load CLIP model once
 print("[ModelServer] Loading CLIP model...")
-from generate_attention_masks.clip_api.clip_model import CLIPMaskGenerator
-from PIL import Image
-
-CLIP_GEN = CLIPMaskGenerator(model_name="ViT-L-14-336", layer_index=22, device=None)
-print("[ModelServer] CLIP model loaded")
+try:
+    from generate_attention_masks.clip_api.clip_model import CLIPMaskGenerator
+    CLIP_GEN = CLIPMaskGenerator(model_name="ViT-L-14-336", layer_index=22, device=None)
+    print("[ModelServer] CLIP model loaded")
+except Exception as e:
+    print(f"[ModelServer] CLIP path failed; using GroundedSAM fallback: {e}")
+    CLIP_GEN = None
 
 # Load Grounded SAM once (GroundingDINO + SAM)
 print("[ModelServer] Loading GroundedSAMDetector...")
-import sys
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 # Ensure local Grounded_Segment_Anything and its submodules are importable
 _GSA_DIR = os.path.join(_CUR_DIR, "Grounded_Segment_Anything")
 _GSA_DINO_DIR = os.path.join(_GSA_DIR, "GroundingDINO")
-_GSA_DINO_PKG_DIR = os.path.join(_GSA_DINO_DIR, "groundingdino")
+_GSA_DINO_PKG_DIR = os.path.join(_GSA_DIR, "groundingdino")
 _GSA_SAM_DIR = os.path.join(_GSA_DIR, "segment_anything")
 for p in [_GSA_DIR, _GSA_DINO_DIR, _GSA_DINO_PKG_DIR, _GSA_SAM_DIR]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
-import numpy as np
-import tempfile
-import time
-from segment_anything import SamAutomaticMaskGenerator
-import torch
+try:
+    from Grounded_Segment_Anything.grounded_sam_detector import GroundedSAMDetector
+    DETECTOR = GroundedSAMDetector()
+    print("[ModelServer] GroundedSAMDetector loaded")
+except Exception as e:
+    print(f"[ModelServer] GroundedSAMDetector failed: {e}")
+    DETECTOR = None
 
-DETECTOR = GroundedSAMDetector()
-print("[ModelServer] GroundedSAMDetector loaded")
-
-# Optional heavy imports are done lazily in endpoints
+# Preload all diffusion models at startup for faster inference
+print("[ModelServer] Preloading diffusion models...")
 _DIFFUSERS_ENV = {
     "pipe_sdxl": None,
     "controlnet_depth": None,
     "controlnet_canny": None,
+    "lama_manager": None,
 }
 
 # Lazy third-party models
@@ -80,6 +89,64 @@ def _download_to(path: str, url: str):
         print(f"[ModelServer] download failed {url} -> {path}:", e)
         return False
 
+def preload_diffusion_models():
+    """Preload all diffusion models at startup for faster inference"""
+    print("[ModelServer] Preloading SDXL Inpainting...")
+    try:
+        from diffusers import StableDiffusionXLInpaintPipeline, ControlNetModel
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        
+        # Load SDXL Inpainting
+        base = "stabilityai/stable-diffusion-xl-base-1.0"
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            base, 
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32
+        )
+        pipe = pipe.to(device)
+        pipe.enable_attention_slicing()
+        if device == "cuda":
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+            except Exception:
+                pass
+        _DIFFUSERS_ENV["pipe_sdxl"] = pipe
+        print("[ModelServer] SDXL Inpainting loaded")
+        
+        # Load ControlNets
+        try:
+            _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained(
+                "diffusers/controlnet-canny-sdxl-1.0"
+            ).to(device)
+            print("[ModelServer] ControlNet Canny loaded")
+        except Exception as e:
+            print(f"[ModelServer] ControlNet canny unavailable: {e}")
+            
+        try:
+            _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained(
+                "diffusers/controlnet-depth-sdxl-1.0"
+            ).to(device)
+            print("[ModelServer] ControlNet Depth loaded")
+        except Exception as e:
+            print(f"[ModelServer] ControlNet depth unavailable: {e}")
+            
+    except Exception as e:
+        print(f"[ModelServer] SDXL loading failed: {e}")
+
+def preload_lama():
+    """Preload LaMa inpainting model"""
+    print("[ModelServer] Preloading LaMa...")
+    try:
+        from lama_cleaner.model_manager import ModelManager
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _DIFFUSERS_ENV["lama_manager"] = ModelManager(
+            device=device, 
+            no_half=False, 
+            sd_device=None
+        )
+        print("[ModelServer] LaMa loaded")
+    except Exception as e:
+        print(f"[ModelServer] LaMa loading failed: {e}")
+
 def ensure_bisenet_loaded(device: str = None):
     if _BISENET["net"] is not None:
         return _BISENET["net"]
@@ -98,27 +165,14 @@ def ensure_bisenet_loaded(device: str = None):
             _download_to(ckpt, url)
         n_classes = 19
         net = BiSeNet(n_classes=n_classes)
-        map_location = "cpu" if device is None else device
-        state = torch.load(ckpt, map_location=map_location)
-        net.load_state_dict(state)
-        net.eval()
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        net = net.to(device)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        net.load_state_dict(torch.load(ckpt, map_location=device))
+        net.to(device).eval()
         _BISENET["net"] = net
-        try:
-            import torchvision.transforms as T
-            _BISENET["transform"] = T.Compose([
-                T.Resize((512, 512)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-        except Exception as _e:
-            _BISENET["transform"] = None
-        print("[ModelServer] BiSeNet loaded")
         return net
     except Exception as e:
-        print("[ModelServer] BiSeNet load failed:", e)
+        print(f"[ModelServer] BiSeNet load failed: {e}")
         return None
 
 def ensure_fba_loaded(device: str = None):
@@ -127,36 +181,37 @@ def ensure_fba_loaded(device: str = None):
     try:
         repo = os.path.join(_CUR_DIR, "third_party", "FBA_Matting")
         _clone_if_missing("https://github.com/MarcoForte/FBA_Matting.git", repo)
-        # FBA weights
-        weights_dir = os.path.join(repo, "pretrained")
-        _ensure_dir(weights_dir)
-        fba_weights = os.path.join(weights_dir, "FBA.pth")
-        if not os.path.exists(fba_weights):
-            # Known mirrors for FBA weights vary; allow env override or skip
-            alt = os.environ.get("FBA_WEIGHTS_URL", "")
-            if alt:
-                _download_to(fba_weights, alt)
         if repo not in sys.path:
             sys.path.insert(0, repo)
-        # Import model definition
-        from networks.models import build_model  # type: ignore
-        net = build_model("resnet50")
-        if os.path.exists(fba_weights):
-            state = torch.load(fba_weights, map_location="cpu")
-            net.load_state_dict(state)
-        net.eval()
+        from nets import FBA  # type: ignore
+        ckpt_dir = os.path.join(repo, "model")
+        _ensure_dir(ckpt_dir)
+        ckpt = os.path.join(ckpt_dir, "FBA.pth")
+        if not os.path.exists(ckpt):
+            # Try alternative paths
+            alt_paths = [
+                os.path.join(repo, "FBA.pth"),
+                os.path.join(repo, "model", "FBA.pth"),
+            ]
+            for alt_path in alt_paths:
+                if os.path.exists(alt_path):
+                    ckpt = alt_path
+                    break
+            else:
+                # Download from configurable URL
+                fba_url = os.getenv("FBA_WEIGHTS_URL", "https://github.com/MarcoForte/FBA_Matting/releases/download/v1.0/FBA.pth")
+                _download_to(ckpt, fba_url)
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        net = net.to(device)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        net = FBA()
+        net.load_state_dict(torch.load(ckpt, map_location=device))
+        net.to(device).eval()
         _FBA["net"] = net
-        print("[ModelServer] FBA Matting model loaded")
         return net
     except Exception as e:
-        print("[ModelServer] FBA Matting load failed:", e)
+        print(f"[ModelServer] FBA Matting load failed: {e}")
         return None
 
-# Try to initialize OCR backends lazily when used
-_EASYOCR_READER = None
 def _ensure_easyocr():
     global _EASYOCR_READER
     if _EASYOCR_READER is None:
@@ -1118,7 +1173,6 @@ class Handler(BaseHTTPRequestHandler):
         if endpoint == "inpaint_lama":
             try:
                 # Preview-quality inpaint. If LaMa not available, fallback to OpenCV Telea.
-                import cv2
                 image_path = ensure_image_path(payload)
                 mask_png = payload.get("mask_png", "")
                 if not image_path or not os.path.exists(image_path):
@@ -1136,16 +1190,15 @@ class Handler(BaseHTTPRequestHandler):
                 mask_arr = np.array(Image.open(BytesIO(mbytes)).convert("L"))
                 mask_bin = (mask_arr > 127).astype(np.uint8) * 255
 
-                # Try LaMa via lama-cleaner if available
+                # Try LaMa via preloaded model if available
                 result = None
                 try:
-                    from lama_cleaner.model_manager import ModelManager  # type: ignore
-                    from lama_cleaner.schema import HDStrategy  # type: ignore
-                    _global = getattr(self, "_LAMA_MM", None)
-                    if _global is None:
-                        self._LAMA_MM = ModelManager(device="cuda" if torch.cuda.is_available() else "cpu", no_half=False, sd_device=None)
-                    res = self._LAMA_MM(image=img[:, :, ::-1], mask=mask_bin, hd_strategy=HDStrategy.CROP, hd_strategy_crop_margin=64, hd_strategy_crop_trigger_size=512, hd_strategy_resize_limit=1024)
-                    result = res[:, :, ::-1]
+                    if _DIFFUSERS_ENV["lama_manager"] is not None:
+                        from lama_cleaner.schema import HDStrategy  # type: ignore
+                        res = _DIFFUSERS_ENV["lama_manager"](image=img[:, :, ::-1], mask=mask_bin, hd_strategy=HDStrategy.CROP, hd_strategy_crop_margin=64, hd_strategy_crop_trigger_size=512, hd_strategy_resize_limit=1024)
+                        result = res[:, :, ::-1]
+                    else:
+                        raise Exception("LaMa not preloaded")
                 except Exception as e:
                     print("[ModelServer] LaMa not available, using Telea fallback:", e)
                     result = cv2.inpaint(img, (mask_bin > 0).astype(np.uint8), 3, cv2.INPAINT_TELEA)
@@ -1173,38 +1226,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not mask_png:
                     return self._send(400, {"error": "mask_png required (data URL)"})
 
-                device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-                # Lazy load diffusers pipeline
+                # Use preloaded models
                 if _DIFFUSERS_ENV["pipe_sdxl"] is None:
-                    from diffusers import StableDiffusionXLInpaintPipeline, ControlNetModel
-                    import torch as _torch
-                    base = "stabilityai/stable-diffusion-xl-base-1.0"
-                    try:
-                        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(base, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32)
-                    except Exception:
-                        # Some hubs provide direct inpaint models; fallback to base
-                        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(base, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32)
-                    pipe = pipe.to(device)
-                    pipe.enable_attention_slicing()
-                    if device == "cuda":
-                        try:
-                            pipe.enable_xformers_memory_efficient_attention()
-                        except Exception:
-                            pass
-                    _DIFFUSERS_ENV["pipe_sdxl"] = pipe
-                    # ControlNets lazy
-                    try:
-                        _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained("diffusers/controlnet-canny-sdxl-1.0")
-                    except Exception as _e:
-                        print("[ModelServer] ControlNet canny unavailable:", _e)
-                    try:
-                        _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained("diffusers/controlnet-depth-sdxl-1.0")
-                    except Exception as _e:
-                        print("[ModelServer] ControlNet depth unavailable:", _e)
+                    return self._send(500, {"error": "SDXL model not preloaded"})
 
                 pipe = _DIFFUSERS_ENV["pipe_sdxl"]
-                from diffusers.utils import load_image as _load_image
-                import cv2
+                device = next(pipe.parameters()).device
 
                 # Load image & mask
                 pil = Image.open(image_path).convert("RGB")
@@ -1215,6 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
                     m64 = mask_png
                 mbytes = base64.b64decode(m64)
                 mask = Image.open(BytesIO(mbytes)).convert("L").resize((W, H))
+                
                 # Build ControlNet conditions
                 control_images = []
                 control_nets = []
@@ -1224,11 +1252,10 @@ class Handler(BaseHTTPRequestHandler):
                     edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
                     control_images.append(Image.fromarray(edges_rgb))
                     control_nets.append(_DIFFUSERS_ENV["controlnet_canny"])
+                    
                 if use_depth and _DIFFUSERS_ENV["controlnet_depth"] is not None:
                     try:
                         # Try MiDaS small via torch.hub as a lightweight depth
-                        import torch
-                        import torchvision.transforms as T
                         midas = torch.hub.load("intel-isl/MiDaS", "DPT_Small")
                         midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
                         transform = midas_transforms.small_transform

@@ -32,13 +32,25 @@ async function saveTempImage(imageData: string, basename = "edit_input.jpg") {
 }
 
 async function callModelServer(path: string, body: any) {
-  const r = await fetch(`${MODEL_SERVER_URL}/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-  if (!r.ok) throw new Error(`${path} ${r.status}: ${await r.text()}`)
-  return r.json()
+  console.log(`[edit-agent] Calling model server: ${path}`)
+  try {
+    const r = await fetch(`${MODEL_SERVER_URL}/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    if (!r.ok) {
+      const errorText = await r.text()
+      console.error(`[edit-agent] Model server error ${path}: ${r.status} - ${errorText}`)
+      throw new Error(`${path} ${r.status}: ${errorText}`)
+    }
+    const result = await r.json()
+    console.log(`[edit-agent] Model server success: ${path}`)
+    return result
+  } catch (error) {
+    console.error(`[edit-agent] Model server call failed ${path}:`, error)
+    throw error
+  }
 }
 
 async function callFaceParse(imageData: string) {
@@ -111,23 +123,39 @@ async function inpaintSDXL(imageData: string, maskPng: string, prompt: string, p
 async function openAIImagesEdit(imageData: string, maskPng: string, prompt: string) {
   // https://api.openai.com/v1/images/edits (multipart)
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY missing")
-  const form = new FormData()
-  // Convert data URLs to Blobs
+  
+  // Ensure images are PNG and check size
   const imageBuf = Buffer.from(imageData.split(",")[1], "base64")
   const maskBuf = Buffer.from(maskPng.split(",")[1], "base64")
+  
+  // Check file sizes (4MB = 4 * 1024 * 1024 bytes)
+  if (imageBuf.length > 4 * 1024 * 1024) {
+    throw new Error("Image too large (must be under 4MB)")
+  }
+  if (maskBuf.length > 4 * 1024 * 1024) {
+    throw new Error("Mask too large (must be under 4MB)")
+  }
+  
+  const form = new FormData()
   form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
   form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
   form.append("prompt", prompt)
   form.append("size", "1024x1024")
+  
   const r = await fetch("https://api.openai.com/v1/images/edits", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: form as any,
   })
-  if (!r.ok) throw new Error(`openai images ${r.status}: ${await r.text()}`)
+  
+  if (!r.ok) {
+    const errorText = await r.text()
+    throw new Error(`openai images ${r.status}: ${errorText}`)
+  }
+  
   const data = await r.json()
   const b64 = data.data?.[0]?.b64_json
-  if (!b64) throw new Error("openai images: empty result")
+  if (!b64) throw new Error("No image data in response")
   return { processedImageData: `data:image/png;base64,${b64}` }
 }
 
@@ -142,7 +170,10 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
   form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
   const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
     method: "POST",
-    headers: { Authorization: `Bearer ${STABILITY_API_KEY}` },
+    headers: { 
+      Authorization: `Bearer ${STABILITY_API_KEY}`,
+      Accept: "application/json"
+    },
     body: form as any,
   })
   if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
@@ -160,41 +191,75 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
 }
 
 export async function POST(req: NextRequest) {
+  console.log("[edit-agent] Received request")
+  console.log("[edit-agent] Model server URL:", MODEL_SERVER_URL)
+  
   try {
-    const { imageData, instruction, aiModel, previewOnly } = (await req.json()) as EditAgentInput
+    // Check if model server is reachable
+    try {
+      const healthCheck = await fetch(`${MODEL_SERVER_URL}/health`, { method: "GET" })
+      if (!healthCheck.ok) {
+        console.error("[edit-agent] Model server health check failed:", healthCheck.status)
+        return NextResponse.json({ error: "Model server not responding" }, { status: 503 })
+      }
+      console.log("[edit-agent] Model server health check passed")
+    } catch (error) {
+      console.error("[edit-agent] Model server health check error:", error)
+      return NextResponse.json({ error: "Cannot connect to model server" }, { status: 503 })
+    }
+    
+    const body = await req.json()
+    console.log("[edit-agent] Request body keys:", Object.keys(body))
+    
+    const { imageData, instruction, aiModel, previewOnly } = body as EditAgentInput
     if (!imageData || !instruction || !aiModel) {
+      console.error("[edit-agent] Missing required fields:", { 
+        hasImageData: !!imageData, 
+        hasInstruction: !!instruction, 
+        hasAiModel: !!aiModel 
+      })
       return NextResponse.json({ error: "Missing imageData, instruction, or aiModel" }, { status: 400 })
     }
 
+    console.log("[edit-agent] Processing:", { instruction, aiModel, previewOnly })
     const steps: StepLog[] = []
     const { imagePath } = await saveTempImage(imageData)
     steps.push({ step: "upload", info: { imagePath } })
 
     // Analyze intent and targets
     const intent = parseIntent(instruction)
+    console.log("[edit-agent] Parsed intent:", intent)
     steps.push({ step: "analyze", info: intent })
 
     // If lighting/tone -> local enhance
     if (intent.isLighting && !intent.isRemove && !intent.isReplace) {
+      console.log("[edit-agent] Processing lighting enhancement")
       // If face-related, get face mask and apply targeted enhancement
       let maskPng: string | undefined = undefined
       if (intent.mentionsFace) {
         try {
+          console.log("[edit-agent] Getting face mask")
           const fp = await callFaceParse(imageData)
           maskPng = fp.face_mask_png
           steps.push({ step: "face_parse", image: maskPng })
-        } catch {}
+        } catch (error) {
+          console.error("[edit-agent] Face parse failed:", error)
+        }
       }
+      console.log("[edit-agent] Enhancing image locally")
       const enh = await enhanceLocal(imagePath, imageData, { gamma: 0.9, mask_png: maskPng })
       steps.push({ step: "enhance_local", image: enh.processedImageData })
       return NextResponse.json({ ok: true, result: enh.processedImageData, steps })
     }
 
     // Else we need a mask
+    console.log("[edit-agent] Building mask for target:", intent.target || "object")
     const mask = await buildMask(imagePath, imageData, intent.target || "object", { dilate: 3, feather: 3 })
     if (!mask.mask_png) {
+      console.error("[edit-agent] Failed to build mask")
       return NextResponse.json({ error: "Failed to build mask" }, { status: 502 })
     }
+    console.log("[edit-agent] Mask built successfully, pixels:", mask.mask_binary_sum)
     steps.push({ step: "mask", info: { pixels: mask.mask_binary_sum }, image: mask.mask_png })
     // Try matting refine to improve edges
     let refinedMask = mask.mask_png
@@ -283,7 +348,13 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ error: "Unsupported aiModel" }, { status: 400 })
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "error" }, { status: 500 })
+    console.error("[edit-agent] Error in POST handler:", e)
+    console.error("[edit-agent] Error stack:", e?.stack)
+    return NextResponse.json({ 
+      error: e?.message || "Unknown error", 
+      details: e?.toString(),
+      stack: e?.stack 
+    }, { status: 500 })
   }
 }
 
