@@ -1088,14 +1088,15 @@ class Handler(BaseHTTPRequestHandler):
                             
                             # Apply FBA transformations - create tensors directly on the correct device
                             device = next(net.parameters()).device
+                            model_dtype = next(net.parameters()).dtype
                             
                             # Create tensors directly on the correct device
-                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device)
-                            image_transformed = normalise_image(img_t.clone()).to(device)
+                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device=device, dtype=model_dtype)
+                            image_transformed = normalise_image(img_t.clone()).to(device=device, dtype=model_dtype)
                             
                             # Move input tensors to device
-                            img_t = img_t.to(device)
-                            trimap_t = trimap_t.to(device)
+                            img_t = img_t.to(device=device, dtype=model_dtype)
+                            trimap_t = trimap_t.to(device=device, dtype=model_dtype)
                             
                             # Double-check all tensors are on the same device
                             try:
@@ -1509,7 +1510,21 @@ class Handler(BaseHTTPRequestHandler):
                 pipe = _DIFFUSERS_ENV["pipe_sdxl"]
                 # Fix: StableDiffusionXLInpaintPipeline doesn't have parameters() method
                 # Use the device it was loaded on instead
-                device = pipe.device if hasattr(pipe, 'device') else "cuda" if torch.cuda.is_available() else "cpu"
+                device = pipe.device if hasattr(pipe, 'device') else ("cuda" if torch.cuda.is_available() else "cpu")
+                dtype = torch.float16 if (device == "cuda") else torch.float32
+                try:
+                    pipe = pipe.to(device)
+                    # Ensure component dtypes are consistent
+                    if hasattr(pipe, "unet"):
+                        pipe.unet.to(dtype=dtype)
+                    if hasattr(pipe, "vae"):
+                        pipe.vae.to(dtype=dtype)
+                    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+                        pipe.text_encoder.to(dtype=dtype)
+                    if hasattr(pipe, "text_encoder_2") and getattr(pipe, "text_encoder_2", None) is not None:
+                        pipe.text_encoder_2.to(dtype=dtype)
+                except Exception as _e:
+                    print(f"[ModelServer] Warning: could not standardize SDXL component dtypes: {_e}")
 
                 # Load image & mask
                 pil = Image.open(image_path).convert("RGB")
@@ -1530,10 +1545,16 @@ class Handler(BaseHTTPRequestHandler):
                     if _DIFFUSERS_ENV["controlnet_canny"] is None:
                         try:
                             from diffusers import ControlNetModel
-                            device = next(pipe.parameters()).device
-                            _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained(
+                            device = pipe.device if hasattr(pipe, 'device') else device
+                            cn = ControlNetModel.from_pretrained(
                                 "diffusers/controlnet-canny-sdxl-1.0"
-                            ).to(device)
+                            )
+                            try:
+                                cn = cn.to(device)
+                                cn.to(dtype=dtype)
+                            except Exception:
+                                cn = cn.to(device)
+                            _DIFFUSERS_ENV["controlnet_canny"] = cn
                             print("[ModelServer] ControlNet Canny loaded on-demand")
                         except Exception as e:
                             print(f"[ModelServer] ControlNet Canny on-demand loading failed: {e}")
@@ -1551,10 +1572,16 @@ class Handler(BaseHTTPRequestHandler):
                     if _DIFFUSERS_ENV["controlnet_depth"] is None:
                         try:
                             from diffusers import ControlNetModel
-                            device = next(pipe.parameters()).device
-                            _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained(
+                            device = pipe.device if hasattr(pipe, 'device') else device
+                            cn_d = ControlNetModel.from_pretrained(
                                 "diffusers/controlnet-depth-sdxl-1.0"
-                            ).to(device)
+                            )
+                            try:
+                                cn_d = cn_d.to(device)
+                                cn_d.to(dtype=dtype)
+                            except Exception:
+                                cn_d = cn_d.to(device)
+                            _DIFFUSERS_ENV["controlnet_depth"] = cn_d
                             print("[ModelServer] ControlNet Depth loaded on-demand")
                         except Exception as e:
                             print(f"[ModelServer] ControlNet Depth on-demand loading failed: {e}")
@@ -1597,6 +1624,17 @@ class Handler(BaseHTTPRequestHandler):
                         image_encoder=getattr(pipe, "image_encoder", None),
                         feature_extractor=getattr(pipe, "feature_extractor", None),
                     ).to(device)
+                    try:
+                        if hasattr(pipe_c, "unet"):
+                            pipe_c.unet.to(dtype=dtype)
+                        if hasattr(pipe_c, "vae"):
+                            pipe_c.vae.to(dtype=dtype)
+                        if hasattr(pipe_c, "text_encoder") and pipe_c.text_encoder is not None:
+                            pipe_c.text_encoder.to(dtype=dtype)
+                        if hasattr(pipe_c, "text_encoder_2") and getattr(pipe_c, "text_encoder_2", None) is not None:
+                            pipe_c.text_encoder_2.to(dtype=dtype)
+                    except Exception as _e:
+                        print(f"[ModelServer] Warning: could not standardize SDXL+ControlNet component dtypes: {_e}")
                     pipe_c.enable_attention_slicing()
                     if device == "cuda":
                         try:
