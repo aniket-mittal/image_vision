@@ -167,6 +167,11 @@ def preload_diffusion_models():
             
     except Exception as e:
         print(f"[ModelServer] SDXL loading failed: {e}")
+        if "cached_download" in str(e):
+            print("[ModelServer] HuggingFace Hub version compatibility issue detected")
+            print("[ModelServer] SDXL will be loaded on-demand when first requested")
+        else:
+            print(f"[ModelServer] SDXL error: {e}")
 
 def preload_lama():
     """Preload LaMa inpainting model"""
@@ -185,6 +190,7 @@ def preload_lama():
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
         _DIFFUSERS_ENV["lama_manager"] = ModelManager(
+            name="lama",  # Add the missing name parameter
             device=device, 
             no_half=False, 
             sd_device=None
@@ -1309,7 +1315,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(e)})
 
         if endpoint == "inpaint_sdxl":
+            # Try SDXL first, fallback to simple inpainting if it fails
             try:
+                return self._inpaint_sdxl_handler(payload)
+            except Exception as e:
+                print(f"[ModelServer] SDXL inpainting failed, trying fallback: {e}")
+                return self._inpaint_fallback_handler(payload)
+                
+        if endpoint == "inpaint_fallback":
+            return self._inpaint_fallback_handler(payload)
+            
+    def _inpaint_sdxl_handler(self, payload):
+        """Handle SDXL inpainting requests"""
+        try:
                 image_path = ensure_image_path(payload)
                 mask_png = payload.get("mask_png", "")
                 prompt = payload.get("prompt", "")
@@ -1348,7 +1366,35 @@ class Handler(BaseHTTPRequestHandler):
                         print("[ModelServer] SDXL loaded on-demand")
                     except Exception as e:
                         print(f"[ModelServer] SDXL on-demand loading failed: {e}")
-                        return self._send(500, {"error": f"Failed to load SDXL model: {e}"})
+                        if "cached_download" in str(e):
+                            print("[ModelServer] HuggingFace Hub version compatibility issue - trying alternative approach")
+                            try:
+                                # Try with local cache or different download method
+                                import os
+                                os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+                                os.environ["HF_HUB_OFFLINE"] = "0"
+                                
+                                # Try loading with different parameters
+                                pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+                                    base, 
+                                    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                                    local_files_only=False,
+                                    resume_download=True
+                                )
+                                pipe = pipe.to(device)
+                                pipe.enable_attention_slicing()
+                                if device == "cuda":
+                                    try:
+                                        pipe.enable_xformers_memory_efficient_attention()
+                                    except Exception:
+                                        pass
+                                _DIFFUSERS_ENV["pipe_sdxl"] = pipe
+                                print("[ModelServer] SDXL loaded on-demand with alternative method")
+                            except Exception as e2:
+                                print(f"[ModelServer] Alternative SDXL loading also failed: {e2}")
+                                return self._send(500, {"error": "SDXL model loading failed due to HuggingFace Hub compatibility issues. Please check your huggingface_hub and diffusers versions."})
+                        else:
+                            return self._send(500, {"error": f"Failed to load SDXL model: {e}"})
 
                 pipe = _DIFFUSERS_ENV["pipe_sdxl"]
                 device = next(pipe.parameters()).device
@@ -1471,6 +1517,47 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print("[ModelServer] inpaint_sdxl error:", e)
                 return self._send(500, {"error": str(e)})
+                
+    def _inpaint_fallback_handler(self, payload):
+        """Handle fallback inpainting when SDXL fails"""
+        try:
+            image_path = ensure_image_path(payload)
+            mask_png = payload.get("mask_png", "")
+            
+            if not image_path or not os.path.exists(image_path):
+                return self._send(400, {"error": "invalid image_path"})
+            if not mask_png:
+                return self._send(400, {"error": "mask_png required (data URL)"})
+                
+            # Load image & mask
+            pil = Image.open(image_path).convert("RGB")
+            W, H = pil.size
+            if mask_png.startswith("data:image"):
+                _, m64 = mask_png.split(",", 1)
+            else:
+                m64 = mask_png
+            mbytes = base64.b64decode(m64)
+            mask = Image.open(BytesIO(mbytes)).convert("L").resize((W, H))
+            
+            # Convert to numpy arrays
+            image_np = np.array(pil)
+            mask_np = np.array(mask)
+            
+            # Use OpenCV inpainting as fallback
+            result = cv2_inpaint_fallback(image_np, mask_np)
+            
+            # Convert back to PIL and encode
+            result_pil = Image.fromarray(result)
+            b64 = np_to_jpeg_base64(result_pil)
+            
+            return self._send(200, {
+                "processedImageData": f"data:image/jpeg;base64,{b64}",
+                "warning": "Used fallback inpainting (OpenCV TELEA) instead of SDXL"
+            })
+            
+        except Exception as e:
+            print("[ModelServer] fallback inpainting error:", e)
+            return self._send(500, {"error": f"Fallback inpainting failed: {e}"})
 
         if endpoint == "validate_edit":
             try:
