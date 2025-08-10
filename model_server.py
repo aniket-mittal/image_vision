@@ -424,9 +424,14 @@ class Handler(BaseHTTPRequestHandler):
                     # Upscale to image size for precise geometry
                     W, H = pil_image.size
                     am_up = cv2.resize(am_np.astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
-                    # Percentile thresholding for saliency
-                    p = np.percentile(am_up, 85.0)
-                    binm = (am_up >= max(0.0, min(1.0, p))).astype(np.uint8)
+                    # Adaptive saliency threshold using Otsu fallback if percentile fails
+                    try:
+                        p = float(np.percentile(am_up, 85.0))
+                        thr = max(0.0, min(1.0, p))
+                        binm = (am_up >= thr).astype(np.uint8)
+                    except Exception:
+                        _, binm = cv2.threshold((am_up * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        binm = (binm > 0).astype(np.uint8)
                     # Find contours and build regions
                     contours, _ = cv2.findContours(binm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     regions = []
@@ -452,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
                             "area_fraction": float(area) / float(W * H),
                         })
                     # Sort by combined saliency (mean * area) and clip top-5
-                    regions = sorted(regions, key=lambda r: r["mean"] * max(1e-6, r["area_fraction"]), reverse=True)[:5]
+                    regions = sorted(regions, key=lambda r: (r["mean"] * 0.7 + r["area_fraction"] * 0.3), reverse=True)[:5]
                     # Legacy single bbox: union of top region or fallback to whole image
                     if regions:
                         xs = [r["bbox"][0] for r in regions] + [r["bbox"][2] for r in regions]

@@ -262,9 +262,10 @@ Choose the technique that will provide the most relevant context for the current
               bestCoords = coordinateHistory.objects[coordinateHistory.objects.length - 1].bbox
               coordSource = "objects"
             } else if (coordinateHistory.attention && coordinateHistory.attention.length > 0) {
-              const lastAttention = coordinateHistory.attention[coordinateHistory.attention.length - 1]
-              if (lastAttention.bbox && lastAttention.bbox.length === 4) {
-                bestCoords = lastAttention.bbox
+              // Use the highest-saliency attention region (array is sorted by server)
+              const bestAttention = coordinateHistory.attention[0]
+              if (bestAttention.bbox && bestAttention.bbox.length === 4) {
+                bestCoords = bestAttention.bbox
                 coordSource = "attention"
               }
             } else if (coordinateHistory.segmentation && coordinateHistory.segmentation.length > 0) {
@@ -304,15 +305,7 @@ Choose the technique that will provide the most relevant context for the current
                 plan.params.x2 = Math.round(centerX + width / 2)
                 plan.params.y2 = Math.round(centerY + height / 2)
                 
-                // Use appropriate blur strength for the region size
-                const regionArea = width * height
-                if (regionArea < 0.05) {
-                  plan.params.blur_strength = 8  // Less blur for very small regions
-                } else if (regionArea < 0.15) {
-                  plan.params.blur_strength = 12 // Moderate blur for small regions
-                } else {
-                  plan.params.blur_strength = 15 // Standard blur for larger regions
-                }
+                // Keep blur strength as provided or default later
               } else {
                 // For box masking, use pixel coordinates directly (server will clamp)
                 plan.params.x1 = Math.round(Math.max(0, x1))
@@ -451,10 +444,12 @@ Choose the technique that will provide the most relevant context for the current
             const attn = await runAttention(imagePath, attnQuery, plan.params || {})
             processed = attn.processedImageData
             
-            // Store attention coordinates
+            // Store attention coordinates (preserve order from server: highest saliency first)
             if (Array.isArray((attn as any).attention_regions)) {
               coordinateHistory.attention = (attn as any).attention_regions.map((r: any) => ({
                 bbox: r.bbox,
+                polygon: r.polygon,
+                mean: r.mean,
                 area_fraction: r.area_fraction,
                 step: i + 1
               }))
