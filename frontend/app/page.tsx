@@ -68,6 +68,14 @@ export default function AIImageAnalyzer() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const chatMessagesRef = useRef<HTMLDivElement>(null)
+
+  // Auto-scroll chat to bottom when new messages arrive
+  useEffect(() => {
+    if (chatMessagesRef.current) {
+      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight
+    }
+  }, [messages, isLoading])
 
   // Draw blurred background with highlighted selection (crop or lasso)
   const drawHighlightOverlay = useCallback(
@@ -287,9 +295,8 @@ export default function AIImageAnalyzer() {
                         setAgentEvents((prev) => [...prev, `Detected ${evt.objects.length} object regions`])
                       }
                     } else if (evt.type === "verdict") {
-                      const scoreTxt = (typeof evt.score === "number" && evt.score.toFixed) ? evt.score.toFixed(2) : evt.score
                       const line = evt.narrative ? evt.narrative : `Continuing analysis to improve clarity/relevance.`
-                      setAgentEvents((prev) => [...prev, `Verdict step ${evt.step}: score=${scoreTxt} good=${evt.good}`, line])
+                      setAgentEvents((prev) => [...prev, line])
                     } else if (evt.type === "final") {
                       if (evt.final?.processedImageData) setProcessedImage(evt.final.processedImageData)
                       const answer = evt.answer || ""
@@ -800,7 +807,7 @@ export default function AIImageAnalyzer() {
 
       {/* Chat Sidebar */}
       <div
-        className={`bg-white border-l flex flex-col transition-all duration-300 ${isSidebarCollapsed ? "w-12" : "w-96"}`}
+        className={`bg-white border-l flex flex-col transition-all duration-300 h-screen ${isSidebarCollapsed ? "w-12" : "w-96"}`}
       >
         {/* Collapse Toggle */}
         <div className="p-3 border-b flex items-center justify-between">
@@ -821,7 +828,7 @@ export default function AIImageAnalyzer() {
         </div>
 
         {!isSidebarCollapsed && (
-          <div className="flex-1 flex flex-col p-4 space-y-4">
+          <div className="flex-1 flex flex-col p-4 space-y-4 min-h-0 chat-container">
             {/* Model Configuration */}
             <div className="space-y-3">
               <div className={`grid ${mode === "Ask" ? "grid-cols-3" : "grid-cols-2"} gap-3`}>
@@ -915,8 +922,9 @@ export default function AIImageAnalyzer() {
             <Separator />
 
             {/* Chat Messages */}
-            <ScrollArea className="flex-1 -mx-1 px-1">
-              <div className="space-y-3">
+            <div className="chat-messages" ref={chatMessagesRef}>
+              <ScrollArea className="h-full chat-scroll-area">
+                <div className="space-y-3 pb-4">
                 {messages.length === 0 && (
                   <div className="text-center py-12">
                     <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -993,7 +1001,8 @@ export default function AIImageAnalyzer() {
                   </div>
                 )}
               </div>
-            </ScrollArea>
+              </ScrollArea>
+            </div>
 
             {/* Agent activity moved inline in the loading bubble */}
 
