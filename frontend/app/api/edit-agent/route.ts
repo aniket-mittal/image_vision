@@ -197,13 +197,64 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     
     console.log(`Image dimensions: ${imageMetadata.width}x${imageMetadata.height}`);
     
-    // Create FormData for OpenAI API
+    // Compute mask bounding box for precise localized edit
+    const maskMeta = await sharp(maskBuffer).metadata();
+    const mw = maskMeta.width || 0;
+    const mh = maskMeta.height || 0;
+    const maskRaw = await sharp(maskBuffer).threshold(128).toColourspace('b-w').raw().toBuffer();
+    let minX = mw, minY = mh, maxX = -1, maxY = -1;
+    const md = maskRaw;
+    for (let y = 0; y < mh; y++) {
+      for (let x = 0; x < mw; x++) {
+        const v = md[y * mw + x];
+        if (v > 0) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    let useCrop = maxX >= minX && maxY >= minY;
+    // Add padding for context
+    const pad = 16;
+    if (useCrop) {
+      minX = Math.max(0, minX - pad);
+      minY = Math.max(0, minY - pad);
+      maxX = Math.min(mw - 1, maxX + pad);
+      maxY = Math.min(mh - 1, maxY + pad);
+    }
+
+    // Prepare image/mask to send: cropped region scaled to 1024x1024
+    let sendImage = imageBuffer;
+    let sendMask = maskBuffer;
+    let cropLeft = 0, cropTop = 0, cropWidth = mw, cropHeight = mh;
+    if (useCrop) {
+      cropLeft = minX; cropTop = minY; cropWidth = maxX - minX + 1; cropHeight = maxY - minY + 1;
+      const sendImageBuf = await sharp(imageBuffer)
+        .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+        .resize(1024, 1024, { fit: 'fill' })
+        .png()
+        .toBuffer();
+      sendImage = Buffer.from(sendImageBuf);
+      const sendMaskBuf = await sharp(maskBuffer)
+        .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+        .resize(1024, 1024, { fit: 'fill' })
+        .threshold(128)
+        .toColourspace('b-w')
+        .png()
+        .toBuffer();
+      sendMask = Buffer.from(sendMaskBuf);
+      console.log(`Cropped mask bbox: [${cropLeft},${cropTop},${cropWidth},${cropHeight}] and resized to 1024x1024`);
+    }
+
+    // Create FormData for OpenAI API with cropped/uncropped payloads
     const formData = new FormData();
-    formData.append('image', new Blob([imageBuffer], { type: 'image/png' }), 'image.png');
-    formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+    formData.append('image', new Blob([sendImage], { type: 'image/png' }), 'image.png');
+    formData.append('mask', new Blob([sendMask], { type: 'image/png' }), 'mask.png');
     formData.append('prompt', prompt);
     formData.append('n', '1');
-    formData.append('size', '1024x1024'); // OpenAI edits always return 1024x1024
+    formData.append('size', '1024x1024');
     
     console.log("Sending request to OpenAI with:");
     console.log(`- Image size: ${imageBuffer.length} bytes`);
@@ -259,43 +310,43 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       throw new Error("No image data in response");
     }
 
-    // Post-process: restore original aspect ratio and composite with original using mask
-    if (imageMetadata.width && imageMetadata.height) {
+    // Post-process: if cropped, resize back to bbox and composite onto original at the bbox
+    const genBuf = Buffer.from(processedImageData.split(',')[1], 'base64');
+    if (useCrop) {
+      const genBackBuf = await sharp(genBuf)
+        .resize(cropWidth, cropHeight, { fit: 'fill' })
+        .toBuffer();
+      const genBack = Buffer.from(genBackBuf);
+      const maskCropBuf = await sharp(maskBuffer)
+        .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+        .threshold(128)
+        .toColourspace('b-w')
+        .removeAlpha() // ensure 1-channel
+        .toBuffer();
+      const maskCrop = Buffer.from(maskCropBuf);
+      const genRGBABuf = await sharp(genBack)
+        .joinChannel(maskCrop)
+        .png()
+        .toBuffer();
+      const genRGBA = Buffer.from(genRGBABuf);
+      const finalCompositeBuf = await sharp(imageBuffer)
+        .composite([{ input: genRGBA, left: cropLeft, top: cropTop }])
+        .png()
+        .toBuffer();
+      processedImageData = `data:image/png;base64,${Buffer.from(finalCompositeBuf).toString('base64')}`;
+      console.log(`Composited cropped generation back to original at [${cropLeft},${cropTop},${cropWidth},${cropHeight}]`);
+    } else if (imageMetadata.width && imageMetadata.height) {
+      // Fallback: previous full-frame aspect preserve + composite
       const originalAspectRatio = imageMetadata.width / imageMetadata.height;
       const targetWidth = 1024;
       const targetHeight = Math.round(targetWidth / originalAspectRatio);
-      
-      const genBuf = Buffer.from(processedImageData.split(',')[1], 'base64');
-      const genResized = await sharp(genBuf)
-        .resize(targetWidth, targetHeight, { fit: 'fill' })
-        .toBuffer();
-
-      // Resize mask to original aspect ratio dimensions and prepare as 8-bit alpha
-      const maskAlpha = await sharp(maskBuffer)
-        .resize(targetWidth, targetHeight, { fit: 'fill' })
-        .threshold(128)
-        .toColourspace('b-w')
-        .ensureAlpha() // guarantees an alpha channel exists
-        .removeAlpha() // keep single channel grayscale
-        .toBuffer();
-
-      // Build RGBA for generated image using mask as alpha
-      const genRGBA = await sharp(genResized)
-        .joinChannel(maskAlpha) // maskAlpha used as alpha channel
-        .png()
-        .toBuffer();
-
-      // Composite: gen over original using alpha so only masked region is replaced
-      const originalResized = await sharp(imageBuffer)
-        .resize(targetWidth, targetHeight, { fit: 'fill' })
-        .toBuffer();
-
-      const finalComposite = await sharp(originalResized)
-        .composite([{ input: genRGBA, blend: 'over' }])
-        .png()
-        .toBuffer();
-
-      processedImageData = `data:image/png;base64,${finalComposite.toString('base64')}`;
+      const genResized = await sharp(genBuf).resize(targetWidth, targetHeight, { fit: 'fill' }).toBuffer();
+      const maskAlpha = await sharp(maskBuffer).resize(targetWidth, targetHeight, { fit: 'fill' }).threshold(128).toColourspace('b-w').removeAlpha().toBuffer();
+      const genRGBABuf2 = await sharp(genResized).joinChannel(maskAlpha).png().toBuffer();
+      const genRGBA2 = Buffer.from(genRGBABuf2);
+      const originalResized = await sharp(imageBuffer).resize(targetWidth, targetHeight, { fit: 'fill' }).toBuffer();
+      const finalComposite = await sharp(originalResized).composite([{ input: genRGBA2, blend: 'over' }]).png().toBuffer();
+      processedImageData = `data:image/png;base64,${Buffer.from(finalComposite).toString('base64')}`;
       console.log(`Composited generated content into masked region at ${targetWidth}x${targetHeight}`);
     }
 
