@@ -68,7 +68,6 @@ _DIFFUSERS_ENV = {
     "pipe_sdxl": None,
     "controlnet_depth": None,
     "controlnet_canny": None,
-    "lama_manager": None,
 }
 
 # Lazy third-party models
@@ -133,7 +132,7 @@ def preload_diffusion_models():
         device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
         
         # Load SDXL Inpainting
-        base = "stabilityai/stable-diffusion-xl-base-1.0"
+        base = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
             base, 
             torch_dtype=torch.float16 if device == "cuda" else torch.float32
@@ -173,36 +172,7 @@ def preload_diffusion_models():
         else:
             print(f"[ModelServer] SDXL error: {e}")
 
-def preload_lama():
-    """Preload LaMa inpainting model"""
-    print("[ModelServer] Preloading LaMa...")
-    try:
-        # Try multiple import paths for LaMa
-        try:
-            from lama_cleaner.model_manager import ModelManager
-        except ImportError:
-            try:
-                # Alternative import path
-                from lama_cleaner.model.manager import ModelManager
-            except ImportError:
-                print("[ModelServer] LaMa not available: lama_cleaner not found")
-                return
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _DIFFUSERS_ENV["lama_manager"] = ModelManager(
-            name="lama",  # Add the missing name parameter
-            device=device, 
-            no_half=False, 
-            sd_device=None
-        )
-        print("[ModelServer] LaMa loaded")
-    except Exception as e:
-        print(f"[ModelServer] LaMa loading failed: {e}")
-        # Try to provide helpful error message
-        if "cached_download" in str(e):
-            print("[ModelServer] LaMa not available, using Telea fallback: cannot import name 'cached_download' from 'huggingface_hub'")
-        else:
-            print(f"[ModelServer] LaMa error: {e}")
+    
 
 def ensure_bisenet_loaded(device: str = None):
     if _BISENET["net"] is not None:
@@ -560,8 +530,7 @@ class Handler(BaseHTTPRequestHandler):
                     "grounded_sam": DETECTOR is not None,
                     "sam_amg": SAM_AMG is not None,
                     "fba": _FBA["net"] is not None,
-                    "bisenet": _BISENET["net"] is not None,
-                    "lama": _DIFFUSERS_ENV["lama_manager"] is not None
+                    "bisenet": _BISENET["net"] is not None
                 }
             }
             return self._send(200, health_status)
@@ -1072,6 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
                             pass
             except Exception as e:
                 print("[ModelServer] Segmentation GroundedDINO error, will fallback to SAM auto:", e)
+                print("[ModelServer] Hint: compile GroundingDINO ops (pip install -e GroundingDINO && python setup.py build_ext --inplace) or ensure correct torchvision/torch CUDA match.")
 
             # Fallback to SAM auto (no text) if needed
             if combined is None:
@@ -1274,45 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] enhance_local error:", e)
                 return self._send(500, {"error": str(e)})
 
-        if endpoint == "inpaint_lama":
-            try:
-                # Preview-quality inpaint. If LaMa not available, fallback to OpenCV Telea.
-                image_path = ensure_image_path(payload)
-                mask_png = payload.get("mask_png", "")
-                if not image_path or not os.path.exists(image_path):
-                    return self._send(400, {"error": "invalid image_path"})
-                if not mask_png:
-                    return self._send(400, {"error": "mask_png required (data URL)"})
-                pil = Image.open(image_path).convert("RGB")
-                img = np.array(pil)[:, :, ::-1]  # to BGR for cv2
-                # Decode mask
-                if mask_png.startswith("data:image"):
-                    _, m64 = mask_png.split(",", 1)
-                else:
-                    m64 = mask_png
-                mbytes = base64.b64decode(m64)
-                mask_arr = np.array(Image.open(BytesIO(mbytes)).convert("L"))
-                mask_bin = (mask_arr > 127).astype(np.uint8) * 255
-
-                # Try LaMa via preloaded model if available
-                result = None
-                try:
-                    if _DIFFUSERS_ENV["lama_manager"] is not None:
-                        from lama_cleaner.schema import HDStrategy  # type: ignore
-                        res = _DIFFUSERS_ENV["lama_manager"](image=img[:, :, ::-1], mask=mask_bin, hd_strategy=HDStrategy.CROP, hd_strategy_crop_margin=64, hd_strategy_crop_trigger_size=512, hd_strategy_resize_limit=1024)
-                        result = res[:, :, ::-1]
-                    else:
-                        raise Exception("LaMa not preloaded")
-                except Exception as e:
-                    print("[ModelServer] LaMa not available, using Telea fallback:", e)
-                    result = cv2.inpaint(img, (mask_bin > 0).astype(np.uint8), 3, cv2.INPAINT_TELEA)
-
-                out_pil = Image.fromarray(result[:, :, ::-1])
-                b64 = np_to_jpeg_base64(out_pil)
-                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
-            except Exception as e:
-                print("[ModelServer] inpaint_lama error:", e)
-                return self._send(500, {"error": str(e)})
+        # Removed LaMa endpoint to reduce footprint. Use SDXL or fallback inpainting.
 
         if endpoint == "inpaint_sdxl":
             # Try SDXL first, fallback to simple inpainting if it fails
@@ -1350,7 +1282,7 @@ class Handler(BaseHTTPRequestHandler):
                         device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
                         
                         # Load SDXL Inpainting
-                        base = "stabilityai/stable-diffusion-xl-base-1.0"
+                        base = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
                         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
                             base, 
                             torch_dtype=torch.float16 if device == "cuda" else torch.float32
@@ -1631,7 +1563,6 @@ def run():
     print("[ModelServer] Starting model preloading...")
     try:
         preload_diffusion_models()
-        preload_lama()
         print("[ModelServer] Model preloading completed")
     except Exception as e:
         print(f"[ModelServer] Error during model preloading: {e}")

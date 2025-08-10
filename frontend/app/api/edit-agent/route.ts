@@ -7,7 +7,7 @@ const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
 const STABILITY_API_KEY = process.env.STABILITY_API_KEY || process.env.STABILITY_KEY || ""
 
-type EditModel = "LaMa" | "SDXL" | "OpenAIImages" | "StabilityAI"
+type EditModel = "SDXL" | "OpenAIImages" | "StabilityAI"
 
 interface EditAgentInput {
   imageData: string
@@ -101,9 +101,7 @@ async function enhanceLocal(imagePath: string, imageData: string, params?: any) 
   return callModelServer("enhance_local", body) as Promise<{ processedImageData: string }>
 }
 
-async function inpaintPreviewLaMa(imageData: string, maskPng: string) {
-  return callModelServer("inpaint_lama", { image_data: imageData, mask_png: maskPng }) as Promise<{ processedImageData: string }>
-}
+// LaMa removed to save VRAM; use SDXL or fallback inpainting instead
 
 async function inpaintSDXL(imageData: string, maskPng: string, prompt: string, params?: any) {
   const body = {
@@ -273,18 +271,18 @@ export async function POST(req: NextRequest) {
 
     // Routing and execution
     let edited: { processedImageData: string } | null = null
-    if (aiModel === "LaMa" || previewOnly) {
-      edited = await inpaintPreviewLaMa(imageData, refinedMask)
-      steps.push({ step: "inpaint_lama", image: edited.processedImageData })
-      // Optional validate
+    if (previewOnly) {
+      // Preview: use lightweight fallback inpainting on server
+      const editedFb = await callModelServer("inpaint_fallback", { image_data: imageData, mask_png: refinedMask }) as { processedImageData: string }
+      steps.push({ step: "inpaint_preview", image: editedFb.processedImageData })
       const val = await callModelServer("validate_edit", {
         original_image_data: imageData,
-        edited_image_data: edited.processedImageData,
+        edited_image_data: editedFb.processedImageData,
         mask_png: refinedMask,
         concept: intent.target || "object",
       })
       steps.push({ step: "validate", info: val })
-      return NextResponse.json({ ok: true, result: edited.processedImageData, steps })
+      return NextResponse.json({ ok: true, result: editedFb.processedImageData, steps })
     }
 
     if (aiModel === "SDXL") {

@@ -24,7 +24,6 @@ type AIModel =
   | "OpenAIImages"
   | "SDXL"
   | "StabilityAI"
-  | "LaMa"
 
 interface Selection {
   type: "crop" | "lasso" | "object-selector"
@@ -654,7 +653,7 @@ export default function AIImageAnalyzer() {
   // Ensure model selection is valid when switching modes
   useEffect(() => {
     const askModels: AIModel[] = ["GPT", "Claude", "Gemini", "LLaVA", "Qwen", "Auto"]
-    const editModels: AIModel[] = ["OpenAIImages", "SDXL", "StabilityAI", "LaMa"]
+   const editModels: AIModel[] = ["OpenAIImages", "SDXL", "StabilityAI"]
     if (mode === "Ask") {
       if (!askModels.includes(aiModel)) {
         setAIModel("GPT")
@@ -926,7 +925,7 @@ export default function AIImageAnalyzer() {
                           <SelectItem value="OpenAIImages">OpenAI Images</SelectItem>
                           <SelectItem value="SDXL">SDXL</SelectItem>
                           <SelectItem value="StabilityAI">Stability AI</SelectItem>
-                          <SelectItem value="LaMa">LaMa</SelectItem>
+                         
                         </>
                       )}
                     </SelectContent>
