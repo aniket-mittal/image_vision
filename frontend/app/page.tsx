@@ -11,7 +11,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Crop, Lasso, MousePointer, Upload, Send, Bot, User, ChevronLeft, ChevronRight, Eraser } from "lucide-react"
 
-type Tool = "crop" | "lasso" | "object-selector"
+type Tool = "crop" | "lasso" | "object-selector" | null
 type Mode = "Ask" | "Edit"
 type ProcessingMode = "Original" | "BlurLight" | "BlurDeep" | "Injection"
 type AIModel =
@@ -27,7 +27,7 @@ type AIModel =
   | "LaMa"
 
 interface Selection {
-  type: Tool
+  type: "crop" | "lasso" | "object-selector"
   coordinates: number[]
   imageData?: string | null
 }
@@ -40,7 +40,7 @@ interface Message {
 
 export default function AIImageAnalyzer() {
   const [mode, setMode] = useState<Mode>("Ask")
-  const [selectedTool, setSelectedTool] = useState<Tool>("crop")
+  const [selectedTool, setSelectedTool] = useState<Tool>(null)
   const [processingMode, setProcessingMode] = useState<ProcessingMode>("Original")
   const [aiModel, setAIModel] = useState<AIModel>("GPT")
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
@@ -432,7 +432,7 @@ export default function AIImageAnalyzer() {
 
   const handleCanvasMouseDown = useCallback(
     (event: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!canvasRef.current) return
+      if (!canvasRef.current || !selectedTool) return
 
       const rect = canvasRef.current.getBoundingClientRect()
       const x = event.clientX - rect.left
@@ -451,7 +451,7 @@ export default function AIImageAnalyzer() {
 
   const handleCanvasMouseMove = useCallback(
     (event: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!isDrawing || !canvasRef.current) return
+      if (!isDrawing || !canvasRef.current || !selectedTool) return
       // Guard: if base <img> not ready/broken, skip drawing
       if (!imageRef.current || !imageRef.current.complete) return
 
@@ -477,11 +477,11 @@ export default function AIImageAnalyzer() {
   )
 
   const handleCanvasMouseUp = useCallback(() => {
-    if (!isDrawing) return
+    if (!isDrawing || !selectedTool) return
 
     setIsDrawing(false)
 
-    if (drawPath.length > 0) {
+    if (drawPath.length > 0 && selectedTool) {
       const selectionData: Selection = {
         type: selectedTool,
         coordinates: drawPath,
@@ -560,7 +560,7 @@ export default function AIImageAnalyzer() {
           .map((o: any) => {
             const [bx1, by1, bx2, by2] = o.bbox as number[]
             const coords = [bx1 * sX, by1 * sY, bx2 * sX, by2 * sY]
-            return { type: "object-selector" as Tool, coordinates: coords, imageData: uploadedImage }
+            return { type: "object-selector" as const, coordinates: coords, imageData: uploadedImage }
           })
         const merged = [...nonObjectSelections, ...objectSelections]
         setSelections(merged)
@@ -787,7 +787,7 @@ export default function AIImageAnalyzer() {
               />
               
               {/* Tool Instructions Overlay */}
-              {(selectedTool === "crop" || selectedTool === "lasso") && selections.length === 0 && (
+              {selectedTool && (selectedTool === "crop" || selectedTool === "lasso") && selections.length === 0 && (
                 <div className="absolute top-4 left-4 bg-black bg-opacity-75 text-white px-3 py-2 rounded-lg text-sm">
                   {selectedTool === "crop" ? "Click and drag to select a rectangular region" : "Click and drag to draw a selection path"}
                 </div>
