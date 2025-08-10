@@ -1014,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if endpoint == "matting_refine":
             try:
+                import cv2  # Add cv2 import here
                 image_path = ensure_image_path(payload)
                 mask_png = payload.get("mask_png", "")
                 if not image_path or not os.path.exists(image_path):
@@ -1052,30 +1053,67 @@ class Handler(BaseHTTPRequestHandler):
                             refined = None
                     else:
                         try:
-                            # Minimal guided refinement: expand soft edges near boundary; FBA typically needs trimap
-                            # Build a pseudo-trimap from soft mask
-                            fg = (mask_np > 0.9).astype(np.uint8) * 255
-                            bg = (mask_np < 0.1).astype(np.uint8) * 255
-                            import cv2
-                            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                            fg_d = cv2.erode(fg, k, iterations=1)
-                            bg_d = cv2.erode(bg, k, iterations=1)
-                            trimap = np.full((H, W), 128, dtype=np.uint8)
-                            trimap[bg_d > 0] = 0
-                            trimap[fg_d > 0] = 255
-                            # FBA expects tensors; adaptively call its inference util if available
+                            # Use the correct FBA API from demo.py - requires 4 arguments
+                            try:
+                                from networks.transforms import trimap_transform, normalise_image
+                            except ImportError as transform_error:
+                                print(f"[ModelServer] FBA transforms not available: {transform_error}")
+                                print("[ModelServer] FBA refine will use fallback method")
+                                refined = None
+                                raise Exception("FBA transforms not available")
+                            
+                            # Build a pseudo-trimap from soft mask (2-channel format as expected by FBA)
+                            fg = (mask_np > 0.9).astype(np.uint8)
+                            bg = (mask_np < 0.1).astype(np.uint8)
+                            
+                            # Create 2-channel trimap as expected by FBA
+                            trimap_2ch = np.stack([bg, fg], axis=-1).astype(np.float32)
+                            
+                            # Scale inputs to multiple of 8 (FBA requirement)
+                            def scale_input(x, scale=1.0):
+                                h, w = x.shape[:2]
+                                h1 = int(np.ceil(scale * h / 8) * 8)
+                                w1 = int(np.ceil(scale * w / 8) * 8)
+                                return cv2.resize(x, (w1, h1), interpolation=cv2.INTER_LANCZOS4)
+                            
+                            # Scale image and trimap
+                            image_scaled = scale_input(np.array(pil).astype(np.float32) / 255.0)
+                            trimap_scaled = scale_input(trimap_2ch)
+                            
+                            # Convert to tensors
                             from torchvision import transforms as T
                             to_tensor = T.ToTensor()
-                            img_t = to_tensor(pil).unsqueeze(0)
-                            trimap_t = torch.from_numpy(trimap).float().unsqueeze(0).unsqueeze(0) / 255.0
-                            img_t = img_t.to(next(net.parameters()).device)
-                            trimap_t = trimap_t.to(next(net.parameters()).device)
+                            img_t = to_tensor(image_scaled).unsqueeze(0)
+                            trimap_t = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0)
+                            
+                            # Apply FBA transformations
+                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0)
+                            image_transformed = normalise_image(img_t.clone())
+                            
+                            # Move to device
+                            device = next(net.parameters()).device
+                            img_t = img_t.to(device)
+                            trimap_t = trimap_t.to(device)
+                            trimap_transformed = trimap_transformed.to(device)
+                            image_transformed = image_transformed.to(device)
+                            
+                            # Call FBA with correct 4 arguments
                             with torch.no_grad():
-                                pred = net(img_t, trimap_t)
-                                if isinstance(pred, (list, tuple)):
-                                    pred = pred[0]
-                                alpha = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+                                output = net(img_t, trimap_t, image_transformed, trimap_transformed)
+                                
+                                # Extract alpha channel and resize back to original size
+                                if isinstance(output, (list, tuple)):
+                                    output = output[0]
+                                
+                                # FBA returns [alpha, fg, bg] - we want alpha
+                                alpha_scaled = output[0, 0].cpu().numpy()
+                                
+                                # Resize back to original dimensions
+                                alpha = cv2.resize(alpha_scaled, (W, H), interpolation=cv2.INTER_LANCZOS4)
                                 refined = np.clip(alpha, 0.0, 1.0)
+                                
+                                print("[ModelServer] FBA refine successful using correct 4-argument API")
+                                
                         except Exception as _e:
                             print("[ModelServer] FBA refine failed, will fallback:", _e)
                             refined = None
