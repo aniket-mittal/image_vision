@@ -1090,12 +1090,33 @@ class Handler(BaseHTTPRequestHandler):
                             trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0)
                             image_transformed = normalise_image(img_t.clone())
                             
-                            # Move to device
+                            # Move to device - ensure ALL tensors are on the same device
                             device = next(net.parameters()).device
                             img_t = img_t.to(device)
                             trimap_t = trimap_t.to(device)
                             trimap_transformed = trimap_transformed.to(device)
                             image_transformed = image_transformed.to(device)
+                            
+                            # Double-check all tensors are on the same device
+                            try:
+                                assert img_t.device == device, f"Image tensor on {img_t.device}, expected {device}"
+                                assert trimap_t.device == device, f"Trimap tensor on {trimap_t.device}, expected {device}"
+                                assert trimap_transformed.device == device, f"Trimap transformed on {trimap_transformed.device}, expected {device}"
+                                assert image_transformed.device == device, f"Image transformed on {image_transformed.device}, expected {device}"
+                                
+                                print(f"[ModelServer] All tensors moved to device: {device}")
+                                print(f"[ModelServer] Tensor devices - img_t: {img_t.device}, trimap_t: {trimap_t.device}, trimap_transformed: {trimap_transformed.device}, image_transformed: {image_transformed.device}")
+                            except AssertionError as device_error:
+                                print(f"[ModelServer] Device mismatch detected: {device_error}")
+                                print("[ModelServer] Attempting to fix device mismatch...")
+                                
+                                # Force move all tensors to the correct device
+                                img_t = img_t.to(device)
+                                trimap_t = trimap_t.to(device)
+                                trimap_transformed = trimap_transformed.to(device)
+                                image_transformed = image_transformed.to(device)
+                                
+                                print(f"[ModelServer] Forced device correction - all tensors now on {device}")
                             
                             # Call FBA with correct 4 arguments
                             with torch.no_grad():
@@ -1460,7 +1481,6 @@ class Handler(BaseHTTPRequestHandler):
                             print("[ModelServer] HuggingFace Hub version compatibility issue - trying alternative approach")
                             try:
                                 # Try with local cache or different download method
-                                import os
                                 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
                                 os.environ["HF_HUB_OFFLINE"] = "0"
                                 
