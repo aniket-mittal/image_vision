@@ -107,7 +107,17 @@ export async function POST(req: NextRequest) {
       })
 
       if (!openaiResponse.ok) {
-        throw new Error(`OpenAI API error: ${openaiResponse.statusText}`)
+        const errorText = await openaiResponse.text();
+        console.error("Status:", openaiResponse.status);
+        console.error("x-ratelimit-limit-requests:", openaiResponse.headers.get("x-ratelimit-limit-requests"));
+        console.error("x-ratelimit-remaining-requests:", openaiResponse.headers.get("x-ratelimit-remaining-requests"));
+        console.error("x-ratelimit-reset-requests:", openaiResponse.headers.get("x-ratelimit-reset-requests"));
+        console.error("x-ratelimit-limit-tokens:", openaiResponse.headers.get("x-ratelimit-limit-tokens"));
+        console.error("x-ratelimit-remaining-tokens:", openaiResponse.headers.get("x-ratelimit-remaining-tokens"));
+        console.error("x-ratelimit-reset-tokens:", openaiResponse.headers.get("x-ratelimit-reset-tokens"));
+        console.error("retry-after:", openaiResponse.headers.get("retry-after"));
+        console.error("Body:", errorText);
+        throw new Error(`OpenAI API error: ${openaiResponse.statusText}`);
       }
 
       return new Response(openaiResponse.body, {
