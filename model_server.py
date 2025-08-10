@@ -245,37 +245,11 @@ def ensure_fba_loaded(device: str = None):
             except ImportError as e:
                 import_errors.append(f"repo root import failed: {e}")
         
-        # Strategy 4: Try installing missing dependencies and retry
-        if fba_module is None:
-            print("[ModelServer] All import strategies failed. Attempting to install missing dependencies...")
-            try:
-                import subprocess
-                import sys
-                
-                # Install required packages
-                packages = ["nets", "torch-scatter", "torch-sparse", "torch-cluster", "torch-spline-conv"]
-                for package in packages:
-                    try:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", package], 
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        print(f"[ModelServer] Installed {package}")
-                    except subprocess.CalledProcessError:
-                        print(f"[ModelServer] Failed to install {package}")
-                
-                # Try importing again after installation
-                try:
-                    from nets import FBA  # type: ignore
-                    fba_module = FBA
-                    print("[ModelServer] FBA imported successfully after dependency installation")
-                except ImportError as e:
-                    import_errors.append(f"import after dependency installation failed: {e}")
-                    
-            except Exception as e:
-                import_errors.append(f"dependency installation failed: {e}")
-        
         if fba_module is None:
             print(f"[ModelServer] FBA import failed after all strategies. Errors: {import_errors}")
             print("[ModelServer] FBA Matting not available - some features may be limited")
+            print("[ModelServer] To fix this, install missing dependencies on your server:")
+            print("[ModelServer] pip install nets torch-scatter torch-sparse torch-cluster torch-spline-conv")
             return None
         
         ckpt_dir = os.path.join(repo, "model")
