@@ -2,6 +2,7 @@
 import json
 import os
 import base64
+import tempfile
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
@@ -13,6 +14,14 @@ import torch
 import numpy as np
 from PIL import Image
 import cv2
+
+# Optional imports for advanced features
+try:
+    from skimage.metrics import structural_similarity as ssim
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    SKIMAGE_AVAILABLE = False
+    print("[ModelServer] skimage not available, SSIM validation will be disabled")
 
 # Load CLIP model once
 print("[ModelServer] Loading CLIP model...")
@@ -44,6 +53,15 @@ except Exception as e:
     print(f"[ModelServer] GroundedSAMDetector failed: {e}")
     DETECTOR = None
 
+# Import SAM components for auto-object generation
+try:
+    from segment_anything import SamAutomaticMaskGenerator
+    SAM_AMG = SamAutomaticMaskGenerator
+    print("[ModelServer] SAM AutomaticMaskGenerator imported")
+except Exception as e:
+    print(f"[ModelServer] SAM AutomaticMaskGenerator import failed: {e}")
+    SAM_AMG = None
+
 # Preload all diffusion models at startup for faster inference
 print("[ModelServer] Preloading diffusion models...")
 _DIFFUSERS_ENV = {
@@ -62,6 +80,24 @@ _BISENET = {
 _FBA = {
     "net": None,
 }
+
+# Fallback inpainting method using OpenCV
+def cv2_inpaint_fallback(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Simple inpainting fallback using OpenCV's TELEA algorithm"""
+    try:
+        # Ensure mask is binary and uint8
+        if mask.dtype != np.uint8:
+            mask = (mask > 0.5).astype(np.uint8) * 255
+        
+        # Apply inpainting
+        result = cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
+        return result
+    except Exception as e:
+        print(f"[ModelServer] OpenCV inpainting fallback failed: {e}")
+        return image
+
+# Global variables for lazy loading
+_EASYOCR_READER = None
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -136,7 +172,17 @@ def preload_lama():
     """Preload LaMa inpainting model"""
     print("[ModelServer] Preloading LaMa...")
     try:
-        from lama_cleaner.model_manager import ModelManager
+        # Try multiple import paths for LaMa
+        try:
+            from lama_cleaner.model_manager import ModelManager
+        except ImportError:
+            try:
+                # Alternative import path
+                from lama_cleaner.model.manager import ModelManager
+            except ImportError:
+                print("[ModelServer] LaMa not available: lama_cleaner not found")
+                return
+        
         device = "cuda" if torch.cuda.is_available() else "cpu"
         _DIFFUSERS_ENV["lama_manager"] = ModelManager(
             device=device, 
@@ -146,6 +192,11 @@ def preload_lama():
         print("[ModelServer] LaMa loaded")
     except Exception as e:
         print(f"[ModelServer] LaMa loading failed: {e}")
+        # Try to provide helpful error message
+        if "cached_download" in str(e):
+            print("[ModelServer] LaMa not available, using Telea fallback: cannot import name 'cached_download' from 'huggingface_hub'")
+        else:
+            print(f"[ModelServer] LaMa error: {e}")
 
 def ensure_bisenet_loaded(device: str = None):
     if _BISENET["net"] is not None:
@@ -183,7 +234,20 @@ def ensure_fba_loaded(device: str = None):
         _clone_if_missing("https://github.com/MarcoForte/FBA_Matting.git", repo)
         if repo not in sys.path:
             sys.path.insert(0, repo)
-        from nets import FBA  # type: ignore
+        
+        # Try to import FBA with better error handling
+        try:
+            from nets import FBA  # type: ignore
+        except ImportError as e:
+            print(f"[ModelServer] FBA import failed, trying alternative import: {e}")
+            # Try alternative import paths
+            try:
+                sys.path.insert(0, os.path.join(repo, "nets"))
+                from FBA import FBA  # type: ignore
+            except ImportError:
+                print("[ModelServer] FBA import failed, FBA Matting not available")
+                return None
+        
         ckpt_dir = os.path.join(repo, "model")
         _ensure_dir(ckpt_dir)
         ckpt = os.path.join(ckpt_dir, "FBA.pth")
@@ -201,13 +265,27 @@ def ensure_fba_loaded(device: str = None):
                 # Download from configurable URL
                 fba_url = os.getenv("FBA_WEIGHTS_URL", "https://github.com/MarcoForte/FBA_Matting/releases/download/v1.0/FBA.pth")
                 _download_to(ckpt, fba_url)
+        
+        if not os.path.exists(ckpt):
+            print(f"[ModelServer] FBA checkpoint not found at {ckpt}")
+            return None
+            
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        net = FBA()
-        net.load_state_dict(torch.load(ckpt, map_location=device))
-        net.to(device).eval()
-        _FBA["net"] = net
-        return net
+        
+        # Load model with better error handling
+        try:
+            net = FBA()
+            checkpoint = torch.load(ckpt, map_location=device)
+            net.load_state_dict(checkpoint)
+            net.to(device).eval()
+            _FBA["net"] = net
+            print("[ModelServer] FBA Matting loaded successfully")
+            return net
+        except Exception as e:
+            print(f"[ModelServer] FBA model loading failed: {e}")
+            return None
+            
     except Exception as e:
         print(f"[ModelServer] FBA Matting load failed: {e}")
         return None
@@ -428,22 +506,30 @@ def sam_auto_objects(pil: Image.Image, max_masks: int = 20):
     """Generate object masks using SAM automatic mask generator (no text).
     Returns list of (mask ndarray, bbox [x1,y1,x2,y2]).
     """
-    gen = SamAutomaticMaskGenerator(DETECTOR.sam)
-    image_np = np.array(pil)
-    data = gen.generate(image_np)
-    objs = []
-    count = 0
-    for d in sorted(data, key=lambda x: x.get("area", 0), reverse=True):
-        seg = d.get("segmentation")
-        if seg is None:
-            continue
-        m = seg.astype(np.float32)
-        bbox = mask_bbox(m)
-        objs.append((m, bbox))
-        count += 1
-        if count >= max_masks:
-            break
-    return objs
+    if SAM_AMG is None or DETECTOR is None or DETECTOR.sam is None:
+        print("[ModelServer] SAM components not available for auto-object generation")
+        return []
+    
+    try:
+        gen = SAM_AMG(DETECTOR.sam)
+        image_np = np.array(pil)
+        data = gen.generate(image_np)
+        objs = []
+        count = 0
+        for d in sorted(data, key=lambda x: x.get("area", 0), reverse=True):
+            seg = d.get("segmentation")
+            if seg is None:
+                continue
+            m = seg.astype(np.float32)
+            bbox = mask_bbox(m)
+            objs.append((m, bbox))
+            count += 1
+            if count >= max_masks:
+                break
+        return objs
+    except Exception as e:
+        print(f"[ModelServer] SAM auto-object generation failed: {e}")
+        return []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -460,7 +546,19 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         endpoint = path.split("/")[-1]
         if endpoint == "health":
-            return self._send(200, {"status": "ok"})
+            # Enhanced health check with model status
+            health_status = {
+                "status": "ok",
+                "models": {
+                    "clip": CLIP_GEN is not None,
+                    "grounded_sam": DETECTOR is not None,
+                    "sam_amg": SAM_AMG is not None,
+                    "fba": _FBA["net"] is not None,
+                    "bisenet": _BISENET["net"] is not None,
+                    "lama": _DIFFUSERS_ENV["lama_manager"] is not None
+                }
+            }
+            return self._send(200, health_status)
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1326,7 +1424,6 @@ class Handler(BaseHTTPRequestHandler):
         if endpoint == "validate_edit":
             try:
                 import cv2
-                from skimage.metrics import structural_similarity as ssim
                 orig_data = payload.get("original_image_data")
                 edited_data = payload.get("edited_image_data")
                 concept = payload.get("concept", "object")
@@ -1357,12 +1454,17 @@ class Handler(BaseHTTPRequestHandler):
                 o = np.array(pil_o).astype(np.float32)
                 e = np.array(pil_e).astype(np.float32)
                 # Compute SSIM on ring per channel and average
-                if ring.sum() > 0:
+                if ring.sum() > 0 and SKIMAGE_AVAILABLE:
                     svals = []
                     for c in range(3):
                         so = ssim(o[:, :, c] / 255.0, e[:, :, c] / 255.0, data_range=1.0)
                         svals.append(float(so))
                     seam_ssim = float(np.mean(svals))
+                elif ring.sum() > 0:
+                    # Fallback when skimage is not available - use simple pixel difference
+                    diff = np.abs(o - e) / 255.0
+                    seam_ssim = 1.0 - np.mean(diff[ring > 0])
+                    seam_ssim = max(0.0, min(1.0, seam_ssim))  # Clamp to [0, 1]
                 else:
                     seam_ssim = 1.0
 
