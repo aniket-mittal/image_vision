@@ -1654,7 +1654,7 @@ class Handler(BaseHTTPRequestHandler):
                         image=pil,
                         mask_image=mask,
                         control_image=control_images if len(control_images) > 1 else control_images[0],
-                        guidance_scale=guidance_scale,
+                        guidance_scale=max(4.5, min(9.0, guidance_scale)),
                         num_inference_steps=num_inference_steps,
                         generator=generator,
                     )
@@ -1664,7 +1664,7 @@ class Handler(BaseHTTPRequestHandler):
                         negative_prompt=negative_prompt,
                         image=pil,
                         mask_image=mask,
-                        guidance_scale=guidance_scale,
+                        guidance_scale=max(4.5, min(9.0, guidance_scale)),
                         num_inference_steps=num_inference_steps,
                         generator=generator,
                     )

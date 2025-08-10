@@ -160,7 +160,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     console.log(`Processed image size: ${processedImage.length} chars, mask size: ${processedMask.length} chars`);
     
     // Validate mask format - ensure it's a proper binary mask
-    const maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
+    let maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
     const maskImage = await sharp(maskBuffer);
     const maskMetadata = await maskImage.metadata();
     
@@ -188,6 +188,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .toBuffer();
       const binaryMaskBase64 = `data:image/png;base64,${binaryMask.toString('base64')}`;
       processedMask = binaryMaskBase64;
+      maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
     }
     
     // Get original image dimensions for aspect ratio preservation
@@ -328,28 +329,39 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
   form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
   form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
     
-  const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
-    method: "POST",
-    headers: { 
-      Authorization: `Bearer ${STABILITY_API_KEY}`,
-      Accept: "application/json"
-    },
-    body: form as any,
-  })
+    const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
+      method: "POST",
+      headers: { 
+        Authorization: `Bearer ${STABILITY_API_KEY}`,
+        Accept: "application/json, image/*"
+      },
+      body: form as any,
+    })
     
-  if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
+    if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
     
-  const contentType = r.headers.get("content-type") || ""
-  if (contentType.includes("application/json")) {
-    const j = await r.json()
-    const b64 = j?.artifacts?.[0]?.base64
-    if (!b64) throw new Error("stability: empty result")
-    return { processedImageData: `data:image/png;base64,${b64}` }
-  } else {
+    const contentType = r.headers.get("content-type") || ""
+    if (contentType.includes("application/json")) {
+      const j = await r.json()
+      const b64 = j?.artifacts?.[0]?.base64
+      if (b64) {
+        return { processedImageData: `data:image/png;base64,${b64}` }
+      }
+      // Fallback: sometimes the API returns an image despite JSON header confusion
+      const alt = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${STABILITY_API_KEY}` },
+        body: form as any,
+      })
+      const arr = new Uint8Array(await alt.arrayBuffer())
+      const b64img = Buffer.from(arr).toString("base64")
+      if (!b64img) throw new Error("stability: empty result")
+      return { processedImageData: `data:image/png;base64,${b64img}` }
+    }
+    // Image bytes
     const arr = new Uint8Array(await r.arrayBuffer())
     const b64 = Buffer.from(arr).toString("base64")
     return { processedImageData: `data:image/png;base64,${b64}` }
-    }
   } catch (error) {
     console.error("[edit-agent] Stability AI inpainting failed:", error)
     throw error
