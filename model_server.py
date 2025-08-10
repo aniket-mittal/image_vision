@@ -215,26 +215,28 @@ def ensure_fba_loaded(device: str = None):
         fba_module = None
         import_errors = []
         
-        # Strategy 1: Try importing from networks directory (actual structure)
+        # Strategy 1: Try importing from networks.models (actual structure from demo.py)
         try:
-            networks_dir = os.path.join(repo, "networks")
-            if networks_dir not in sys.path:
-                sys.path.insert(0, networks_dir)
-            from FBA import FBA  # type: ignore
-            fba_module = FBA
-            print("[ModelServer] FBA imported successfully from networks/FBA")
+            # Add the repository root to sys.path first
+            if repo not in sys.path:
+                sys.path.insert(0, repo)
+            from networks.models import build_model  # type: ignore
+            fba_module = build_model
+            print("[ModelServer] FBA imported successfully from networks.models (build_model)")
         except ImportError as e:
-            import_errors.append(f"networks/FBA import failed: {e}")
+            import_errors.append(f"networks.models import failed: {e}")
         
-        # Strategy 2: Try importing from the root of the repo
+        # Strategy 2: Try importing from networks directory directly
         if fba_module is None:
             try:
-                sys.path.insert(0, repo)
-                from FBA import FBA  # type: ignore
-                fba_module = FBA
-                print("[ModelServer] FBA imported successfully from repo root")
+                networks_dir = os.path.join(repo, "networks")
+                if networks_dir not in sys.path:
+                    sys.path.insert(0, networks_dir)
+                from models import build_model  # type: ignore
+                fba_module = build_model
+                print("[ModelServer] FBA imported successfully from networks directory models")
             except ImportError as e:
-                import_errors.append(f"repo root import failed: {e}")
+                import_errors.append(f"networks directory models import failed: {e}")
         
         # Strategy 3: Try importing from nets (fallback for different repo versions)
         if fba_module is None:
@@ -262,19 +264,19 @@ def ensure_fba_loaded(device: str = None):
             print("[ModelServer] FBA Matting not available - some features may be limited")
             print("[ModelServer] To fix this, install missing dependencies on your server:")
             print("[ModelServer] pip install nets torch-scatter torch-sparse torch-cluster torch-spline-conv")
-            return None
+            return _ensure_alternative_matting()
         
         ckpt_dir = os.path.join(repo, "model")
         _ensure_dir(ckpt_dir)
         ckpt = os.path.join(ckpt_dir, "FBA.pth")
         if not os.path.exists(ckpt):
-            # Try alternative paths
+            # Try alternative paths - prioritize the downloaded weights file
             alt_paths = [
-                os.path.join(repo, "FBA.pth"),
-                os.path.join(repo, "model", "FBA.pth"),
+                os.path.join(repo, "FBA.pth"),  # This should exist now
                 os.path.join(repo, "pretrained", "FBA.pth"),
                 os.path.join(repo, "networks", "FBA.pth"),
                 os.path.join(repo, "weights", "FBA.pth"),
+                os.path.join(repo, "model", "FBA.pth"),
             ]
             for alt_path in alt_paths:
                 if os.path.exists(alt_path):
@@ -285,31 +287,66 @@ def ensure_fba_loaded(device: str = None):
                 # Download from configurable URL
                 fba_url = os.getenv("FBA_WEIGHTS_URL", "https://github.com/MarcoForte/FBA_Matting/releases/download/v1.0/FBA.pth")
                 print(f"[ModelServer] Downloading FBA weights from: {fba_url}")
-                _download_to(ckpt, fba_url)
+                if not _download_to(ckpt, fba_url):
+                    print("[ModelServer] FBA weights download failed - using alternative matting method")
+                    return _ensure_alternative_matting()
         
         if not os.path.exists(ckpt):
             print(f"[ModelServer] FBA checkpoint not found at {ckpt}")
-            return None
+            print("[ModelServer] Using alternative matting method")
+            return _ensure_alternative_matting()
             
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         
         # Load model with better error handling
         try:
-            net = fba_module()
-            checkpoint = torch.load(ckpt, map_location=device)
-            net.load_state_dict(checkpoint)
+            # Use build_model function instead of FBA class constructor
+            if hasattr(fba_module, '__call__'):
+                # If fba_module is a function (build_model), call it with weights
+                net = fba_module(ckpt)
+            else:
+                # Fallback to old method if it's a class
+                net = fba_module()
+                checkpoint = torch.load(ckpt, map_location=device)
+                net.load_state_dict(checkpoint)
+            
+            # Move to device and set to eval mode
             net.to(device).eval()
             _FBA["net"] = net
             print("[ModelServer] FBA Matting loaded successfully")
             return net
         except Exception as e:
             print(f"[ModelServer] FBA model loading failed: {e}")
-            return None
+            print("[ModelServer] Falling back to alternative matting method")
+            return _ensure_alternative_matting()
             
     except Exception as e:
         print(f"[ModelServer] FBA Matting load failed: {e}")
-        return None
+        print("[ModelServer] Using alternative matting method")
+        return _ensure_alternative_matting()
+
+def _ensure_alternative_matting():
+    """Fallback to alternative matting methods when FBA is not available"""
+    try:
+        # Try to use rembg as an alternative
+        import rembg
+        print("[ModelServer] Using rembg as alternative matting method")
+        _FBA["alternative"] = "rembg"
+        return "rembg"
+    except ImportError:
+        try:
+            # Try to install rembg
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "rembg"], 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            import rembg
+            print("[ModelServer] Installed and using rembg as alternative matting method")
+            _FBA["alternative"] = "rembg"
+            return "rembg"
+        except Exception as e:
+            print(f"[ModelServer] Failed to install alternative matting: {e}")
+            return None
 
 def _ensure_easyocr():
     global _EASYOCR_READER
@@ -568,17 +605,36 @@ class Handler(BaseHTTPRequestHandler):
         endpoint = path.split("/")[-1]
         if endpoint == "health":
             # Enhanced health check with model status
+            fba_status = "not_loaded"
+            if _FBA["net"] is not None:
+                fba_status = "loaded"
+            elif _FBA.get("alternative") is not None:
+                fba_status = f"alternative_{_FBA['alternative']}"
+            
             health_status = {
                 "status": "ok",
                 "models": {
                     "clip": CLIP_GEN is not None,
                     "grounded_sam": DETECTOR is not None,
                     "sam_amg": SAM_AMG is not None,
-                    "fba": _FBA["net"] is not None,
+                    "fba": fba_status,
                     "bisenet": _BISENET["net"] is not None
                 }
             }
             return self._send(200, health_status)
+        elif endpoint == "test_fba":
+            # Test FBA functionality
+            try:
+                net = ensure_fba_loaded()
+                if net is not None:
+                    if isinstance(net, str) and net == "rembg":
+                        return self._send(200, {"status": "alternative_matting", "method": "rembg"})
+                    else:
+                        return self._send(200, {"status": "fba_loaded", "device": str(next(net.parameters()).device)})
+                else:
+                    return self._send(500, {"status": "fba_failed", "error": "Could not load FBA model"})
+            except Exception as e:
+                return self._send(500, {"status": "fba_error", "error": str(e)})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -976,34 +1032,53 @@ class Handler(BaseHTTPRequestHandler):
                 net = ensure_fba_loaded()
                 refined = None
                 if net is not None:
-                    try:
-                        # Minimal guided refinement: expand soft edges near boundary; FBA typically needs trimap
-                        # Build a pseudo-trimap from soft mask
-                        fg = (mask_np > 0.9).astype(np.uint8) * 255
-                        bg = (mask_np < 0.1).astype(np.uint8) * 255
-                        import cv2
-                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                        fg_d = cv2.erode(fg, k, iterations=1)
-                        bg_d = cv2.erode(bg, k, iterations=1)
-                        trimap = np.full((H, W), 128, dtype=np.uint8)
-                        trimap[bg_d > 0] = 0
-                        trimap[fg_d > 0] = 255
-                        # FBA expects tensors; adaptively call its inference util if available
-                        from torchvision import transforms as T
-                        to_tensor = T.ToTensor()
-                        img_t = to_tensor(pil).unsqueeze(0)
-                        trimap_t = torch.from_numpy(trimap).float().unsqueeze(0).unsqueeze(0) / 255.0
-                        img_t = img_t.to(next(net.parameters()).device)
-                        trimap_t = trimap_t.to(next(net.parameters()).device)
-                        with torch.no_grad():
-                            pred = net(img_t, trimap_t)
-                            if isinstance(pred, (list, tuple)):
-                                pred = pred[0]
-                            alpha = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
-                            refined = np.clip(alpha, 0.0, 1.0)
-                    except Exception as _e:
-                        print("[ModelServer] FBA refine failed, will fallback:", _e)
-                        refined = None
+                    if isinstance(net, str) and net == "rembg":
+                        # Use rembg for alternative matting
+                        try:
+                            import rembg
+                            # Convert PIL to numpy array
+                            img_array = np.array(pil)
+                            # Use rembg to remove background
+                            result = rembg.remove(img_array)
+                            # Extract alpha channel
+                            if result.shape[-1] == 4:
+                                refined = result[..., 3].astype(np.float32) / 255.0
+                            else:
+                                # If no alpha, create from mask
+                                refined = mask_np
+                            print("[ModelServer] Used rembg for matting refinement")
+                        except Exception as _e:
+                            print("[ModelServer] rembg refine failed, will fallback:", _e)
+                            refined = None
+                    else:
+                        try:
+                            # Minimal guided refinement: expand soft edges near boundary; FBA typically needs trimap
+                            # Build a pseudo-trimap from soft mask
+                            fg = (mask_np > 0.9).astype(np.uint8) * 255
+                            bg = (mask_np < 0.1).astype(np.uint8) * 255
+                            import cv2
+                            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                            fg_d = cv2.erode(fg, k, iterations=1)
+                            bg_d = cv2.erode(bg, k, iterations=1)
+                            trimap = np.full((H, W), 128, dtype=np.uint8)
+                            trimap[bg_d > 0] = 0
+                            trimap[fg_d > 0] = 255
+                            # FBA expects tensors; adaptively call its inference util if available
+                            from torchvision import transforms as T
+                            to_tensor = T.ToTensor()
+                            img_t = to_tensor(pil).unsqueeze(0)
+                            trimap_t = torch.from_numpy(trimap).float().unsqueeze(0).unsqueeze(0) / 255.0
+                            img_t = img_t.to(next(net.parameters()).device)
+                            trimap_t = trimap_t.to(next(net.parameters()).device)
+                            with torch.no_grad():
+                                pred = net(img_t, trimap_t)
+                                if isinstance(pred, (list, tuple)):
+                                    pred = pred[0]
+                                alpha = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+                                refined = np.clip(alpha, 0.0, 1.0)
+                        except Exception as _e:
+                            print("[ModelServer] FBA refine failed, will fallback:", _e)
+                            refined = None
                 if refined is None:
                     # Fallback: edge-aware feather using distance transform
                     import cv2
