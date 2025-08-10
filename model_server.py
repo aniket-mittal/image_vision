@@ -215,15 +215,28 @@ def ensure_fba_loaded(device: str = None):
         fba_module = None
         import_errors = []
         
-        # Strategy 1: Try direct import from nets
+        # Strategy 1: Try importing from networks directory (actual structure)
         try:
-            from nets import FBA  # type: ignore
+            networks_dir = os.path.join(repo, "networks")
+            if networks_dir not in sys.path:
+                sys.path.insert(0, networks_dir)
+            from FBA import FBA  # type: ignore
             fba_module = FBA
-            print("[ModelServer] FBA imported successfully from nets")
+            print("[ModelServer] FBA imported successfully from networks/FBA")
         except ImportError as e:
-            import_errors.append(f"nets import failed: {e}")
+            import_errors.append(f"networks/FBA import failed: {e}")
         
-        # Strategy 2: Try importing from nets subdirectory
+        # Strategy 2: Try importing from the root of the repo
+        if fba_module is None:
+            try:
+                sys.path.insert(0, repo)
+                from FBA import FBA  # type: ignore
+                fba_module = FBA
+                print("[ModelServer] FBA imported successfully from repo root")
+            except ImportError as e:
+                import_errors.append(f"repo root import failed: {e}")
+        
+        # Strategy 3: Try importing from nets (fallback for different repo versions)
         if fba_module is None:
             try:
                 nets_dir = os.path.join(repo, "nets")
@@ -235,15 +248,14 @@ def ensure_fba_loaded(device: str = None):
             except ImportError as e:
                 import_errors.append(f"nets/FBA import failed: {e}")
         
-        # Strategy 3: Try importing from the root of the repo
+        # Strategy 4: Try direct import from nets (legacy)
         if fba_module is None:
             try:
-                sys.path.insert(0, repo)
-                from FBA import FBA  # type: ignore
+                from nets import FBA  # type: ignore
                 fba_module = FBA
-                print("[ModelServer] FBA imported successfully from repo root")
+                print("[ModelServer] FBA imported successfully from nets")
             except ImportError as e:
-                import_errors.append(f"repo root import failed: {e}")
+                import_errors.append(f"nets import failed: {e}")
         
         if fba_module is None:
             print(f"[ModelServer] FBA import failed after all strategies. Errors: {import_errors}")
@@ -260,14 +272,19 @@ def ensure_fba_loaded(device: str = None):
             alt_paths = [
                 os.path.join(repo, "FBA.pth"),
                 os.path.join(repo, "model", "FBA.pth"),
+                os.path.join(repo, "pretrained", "FBA.pth"),
+                os.path.join(repo, "networks", "FBA.pth"),
+                os.path.join(repo, "weights", "FBA.pth"),
             ]
             for alt_path in alt_paths:
                 if os.path.exists(alt_path):
                     ckpt = alt_path
+                    print(f"[ModelServer] Found FBA checkpoint at: {ckpt}")
                     break
             else:
                 # Download from configurable URL
                 fba_url = os.getenv("FBA_WEIGHTS_URL", "https://github.com/MarcoForte/FBA_Matting/releases/download/v1.0/FBA.pth")
+                print(f"[ModelServer] Downloading FBA weights from: {fba_url}")
                 _download_to(ckpt, fba_url)
         
         if not os.path.exists(ckpt):
