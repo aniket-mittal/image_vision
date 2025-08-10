@@ -210,7 +210,7 @@ export default function AIImageAnalyzer() {
     setIsLoading(true)
 
     try {
-      // First, process the image if processing is requested in Ask mode (not Original or Injection)
+      // Ask mode processing
       if (mode === "Ask" && processingMode !== "Original" && processingMode !== "Injection") {
         try {
           // Use agentic orchestrator for Blur modes
@@ -323,8 +323,40 @@ export default function AIImageAnalyzer() {
           console.error("Image processing failed:", error)
           setProcessedImage(null)
         }
+      } else if (mode === "Edit") {
+        // Invoke Edit agent: Upload → Analyze → Mask → Route → Execute → Validate → Return
+        try {
+          const body = {
+            imageData: uploadedImage,
+            instruction: input,
+            aiModel,
+          }
+          const res = await fetch("/api/edit-agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          })
+          if (res.ok) {
+            const data = await res.json()
+            if (data?.result) setProcessedImage(data.result)
+            // Log steps inline
+            if (Array.isArray(data?.steps)) {
+              setAgentEvents((prev) => [
+                ...prev,
+                ...data.steps.map((s: any) => s.step + (s.info?.passed === false ? " (retry suggested)" : "")),
+              ])
+              const imgs = data.steps.filter((s: any) => s.image).map((s: any) => s.image as string)
+              if (imgs.length) setAgentStepImages((prev) => [...prev, ...imgs])
+            }
+          } else {
+            console.error("Edit agent failed:", res.status, await res.text())
+          }
+        } catch (err) {
+          console.error("Edit agent error:", err)
+        }
+        // For chat during Edit mode, do not pre-process; we show edited image if any
       } else {
-        // For Original/Injection, or in Edit mode, ensure we send the original image to chat
+        // For Original/Injection in Ask mode, ensure we send the original image to chat
         setProcessedImage(null)
         // Also clear any overlays to prevent perceived blur over the original
         const canvas = canvasRef.current
@@ -671,7 +703,7 @@ export default function AIImageAnalyzer() {
   return (
     <div className="flex h-screen bg-gray-50">
       {/* Main Image Area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col min-h-0">
         {/* Toolbar */}
         <div className="bg-white border-b p-4">
           <div className="flex items-center justify-between">
@@ -733,15 +765,15 @@ export default function AIImageAnalyzer() {
         </div>
 
         {/* Image Display Area */}
-        <div className="flex-1 flex items-center justify-center p-8 relative">
+        <div className="flex-1 flex items-center justify-center p-8 relative min-h-0 overflow-hidden">
           {/* Detect-all progress bar removed per request */}
           {uploadedImage ? (
-            <div className="relative max-w-full max-h-full">
+            <div className="relative w-full h-full">
               <img
                 ref={imageRef}
                 src={processedImage || uploadedImage || "/placeholder.svg"}
                 alt="Uploaded"
-                className="max-w-full max-h-full object-contain"
+                className="w-full h-full object-contain"
                 onLoad={() => {
                   if (canvasRef.current && imageRef.current) {
                     const canvas = canvasRef.current

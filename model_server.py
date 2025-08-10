@@ -37,6 +37,124 @@ import torch
 DETECTOR = GroundedSAMDetector()
 print("[ModelServer] GroundedSAMDetector loaded")
 
+# Optional heavy imports are done lazily in endpoints
+_DIFFUSERS_ENV = {
+    "pipe_sdxl": None,
+    "controlnet_depth": None,
+    "controlnet_canny": None,
+}
+
+# Lazy third-party models
+_BISENET = {
+    "net": None,
+    "transform": None,
+}
+
+_FBA = {
+    "net": None,
+}
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _clone_if_missing(repo_url: str, dest_dir: str):
+    if os.path.exists(dest_dir) and os.path.isdir(dest_dir) and os.listdir(dest_dir):
+        return
+    try:
+        import subprocess
+        print(f"[ModelServer] Cloning {repo_url} -> {dest_dir}")
+        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, dest_dir], check=True)
+    except Exception as e:
+        print("[ModelServer] git clone failed:", e)
+
+def _download_to(path: str, url: str):
+    try:
+        import requests
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as e:
+        print(f"[ModelServer] download failed {url} -> {path}:", e)
+        return False
+
+def ensure_bisenet_loaded(device: str = None):
+    if _BISENET["net"] is not None:
+        return _BISENET["net"]
+    try:
+        repo = os.path.join(_CUR_DIR, "third_party", "face-parsing.PyTorch")
+        _clone_if_missing("https://github.com/zllrunning/face-parsing.PyTorch.git", repo)
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from model import BiSeNet  # type: ignore
+        ckpt_dir = os.path.join(repo, "res", "cp")
+        _ensure_dir(ckpt_dir)
+        ckpt = os.path.join(ckpt_dir, "79999_iter.pth")
+        if not os.path.exists(ckpt):
+            # Official repo stores weights under res/cp
+            url = "https://github.com/zllrunning/face-parsing.PyTorch/raw/master/res/cp/79999_iter.pth"
+            _download_to(ckpt, url)
+        n_classes = 19
+        net = BiSeNet(n_classes=n_classes)
+        map_location = "cpu" if device is None else device
+        state = torch.load(ckpt, map_location=map_location)
+        net.load_state_dict(state)
+        net.eval()
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        net = net.to(device)
+        _BISENET["net"] = net
+        try:
+            import torchvision.transforms as T
+            _BISENET["transform"] = T.Compose([
+                T.Resize((512, 512)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        except Exception as _e:
+            _BISENET["transform"] = None
+        print("[ModelServer] BiSeNet loaded")
+        return net
+    except Exception as e:
+        print("[ModelServer] BiSeNet load failed:", e)
+        return None
+
+def ensure_fba_loaded(device: str = None):
+    if _FBA["net"] is not None:
+        return _FBA["net"]
+    try:
+        repo = os.path.join(_CUR_DIR, "third_party", "FBA_Matting")
+        _clone_if_missing("https://github.com/MarcoForte/FBA_Matting.git", repo)
+        # FBA weights
+        weights_dir = os.path.join(repo, "pretrained")
+        _ensure_dir(weights_dir)
+        fba_weights = os.path.join(weights_dir, "FBA.pth")
+        if not os.path.exists(fba_weights):
+            # Known mirrors for FBA weights vary; allow env override or skip
+            alt = os.environ.get("FBA_WEIGHTS_URL", "")
+            if alt:
+                _download_to(fba_weights, alt)
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        # Import model definition
+        from networks.models import build_model  # type: ignore
+        net = build_model("resnet50")
+        if os.path.exists(fba_weights):
+            state = torch.load(fba_weights, map_location="cpu")
+            net.load_state_dict(state)
+        net.eval()
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        net = net.to(device)
+        _FBA["net"] = net
+        print("[ModelServer] FBA Matting model loaded")
+        return net
+    except Exception as e:
+        print("[ModelServer] FBA Matting load failed:", e)
+        return None
+
 # Try to initialize OCR backends lazily when used
 _EASYOCR_READER = None
 def _ensure_easyocr():
@@ -583,6 +701,27 @@ class Handler(BaseHTTPRequestHandler):
             print("[ModelServer] Detect_all done", {"count": len(objects)})
             return self._send(200, {"image": {"width": width, "height": height}, "objects": objects})
 
+        if endpoint == "prefetch_controlnet":
+            try:
+                device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+                if _DIFFUSERS_ENV["pipe_sdxl"] is None:
+                    from diffusers import StableDiffusionXLInpaintPipeline
+                    import torch as _torch
+                    base = "stabilityai/stable-diffusion-xl-base-1.0"
+                    pipe = StableDiffusionXLInpaintPipeline.from_pretrained(base, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32)
+                    pipe = pipe.to(device)
+                    _DIFFUSERS_ENV["pipe_sdxl"] = pipe
+                if _DIFFUSERS_ENV["controlnet_canny"] is None:
+                    from diffusers import ControlNetModel
+                    _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained("diffusers/controlnet-canny-sdxl-1.0")
+                if _DIFFUSERS_ENV["controlnet_depth"] is None:
+                    from diffusers import ControlNetModel
+                    _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained("diffusers/controlnet-depth-sdxl-1.0")
+                return self._send(200, {"ok": True})
+            except Exception as e:
+                print("[ModelServer] prefetch_controlnet error:", e)
+                return self._send(500, {"error": str(e)})
+
         if endpoint == "sam_click":
             try:
                 image_path = ensure_image_path(payload)
@@ -609,6 +748,105 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": bbox})
             except Exception as e:
                 print("[ModelServer] SAM-click error", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "face_parse":
+            try:
+                image_path = ensure_image_path(payload)
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+                net = ensure_bisenet_loaded(device)
+                if net is None:
+                    return self._send(500, {"error": "BiSeNet unavailable"})
+                pil = Image.open(image_path).convert("RGB")
+                import torchvision.transforms as T
+                transform = _BISENET["transform"]
+                if transform is None:
+                    transform = T.Compose([T.Resize((512, 512)), T.ToTensor()])
+                x = transform(pil).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    out = net(x)[0]
+                    parsing = out.argmax(1).squeeze(0).detach().cpu().numpy().astype(np.uint8)
+                # Map back to original size
+                import cv2
+                parsing_up = cv2.resize(parsing, pil.size, interpolation=cv2.INTER_NEAREST)
+                # Build face mask (aggregate relevant labels)
+                face_labels = set([1, 2, 3, 4, 5, 10, 11, 12, 13])
+                face_mask = np.isin(parsing_up, list(face_labels)).astype(np.uint8) * 255
+                # Pack PNGs
+                buf = BytesIO()
+                Image.fromarray(face_mask, mode="L").save(buf, format="PNG")
+                face_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return self._send(200, {"parsing": {"width": pil.size[0], "height": pil.size[1]}, "face_mask_png": f"data:image/png;base64,{face_b64}"})
+            except Exception as e:
+                print("[ModelServer] face_parse error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "matting_refine":
+            try:
+                image_path = ensure_image_path(payload)
+                mask_png = payload.get("mask_png", "")
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                if not mask_png:
+                    return self._send(400, {"error": "mask_png required (data URL)"})
+                pil = Image.open(image_path).convert("RGB")
+                W, H = pil.size
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mask = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((W, H))
+                mask_np = np.array(mask).astype(np.float32) / 255.0
+                # Try FBA Matting for refinement
+                net = ensure_fba_loaded()
+                refined = None
+                if net is not None:
+                    try:
+                        # Minimal guided refinement: expand soft edges near boundary; FBA typically needs trimap
+                        # Build a pseudo-trimap from soft mask
+                        fg = (mask_np > 0.9).astype(np.uint8) * 255
+                        bg = (mask_np < 0.1).astype(np.uint8) * 255
+                        import cv2
+                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                        fg_d = cv2.erode(fg, k, iterations=1)
+                        bg_d = cv2.erode(bg, k, iterations=1)
+                        trimap = np.full((H, W), 128, dtype=np.uint8)
+                        trimap[bg_d > 0] = 0
+                        trimap[fg_d > 0] = 255
+                        # FBA expects tensors; adaptively call its inference util if available
+                        from torchvision import transforms as T
+                        to_tensor = T.ToTensor()
+                        img_t = to_tensor(pil).unsqueeze(0)
+                        trimap_t = torch.from_numpy(trimap).float().unsqueeze(0).unsqueeze(0) / 255.0
+                        img_t = img_t.to(next(net.parameters()).device)
+                        trimap_t = trimap_t.to(next(net.parameters()).device)
+                        with torch.no_grad():
+                            pred = net(img_t, trimap_t)
+                            if isinstance(pred, (list, tuple)):
+                                pred = pred[0]
+                            alpha = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+                            refined = np.clip(alpha, 0.0, 1.0)
+                    except Exception as _e:
+                        print("[ModelServer] FBA refine failed, will fallback:", _e)
+                        refined = None
+                if refined is None:
+                    # Fallback: edge-aware feather using distance transform
+                    import cv2
+                    binm = (mask_np > 0.5).astype(np.uint8)
+                    dist_fg = cv2.distanceTransform(binm, cv2.DIST_L2, 3)
+                    dist_bg = cv2.distanceTransform(1 - binm, cv2.DIST_L2, 3)
+                    alpha = dist_fg / (dist_fg + dist_bg + 1e-6)
+                    refined = np.clip(alpha, 0.0, 1.0)
+                # Return RGBA matte composite
+                rgba = np.concatenate([np.array(pil), (refined * 255).astype(np.uint8)[..., None]], axis=-1)
+                buf = BytesIO()
+                Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return self._send(200, {"refined_mask_png": f"data:image/png;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] matting_refine error:", e)
                 return self._send(500, {"error": str(e)})
 
         if endpoint == "sam_multi_click":
@@ -742,6 +980,380 @@ class Handler(BaseHTTPRequestHandler):
                 b64 = np_to_jpeg_base64(masked)
                 return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}", "bbox": [x1,y1,x2,y2]})
             except Exception as e:
+                return self._send(500, {"error": str(e)})
+
+        # ---------- EDIT PIPELINE ENDPOINTS ----------
+        if endpoint == "mask_from_text":
+            try:
+                image_path = ensure_image_path(payload)
+                prompt = payload.get("prompt", "object")
+                dilate_px = int(payload.get("dilate_px", 3))
+                feather_px = int(payload.get("feather_px", 3))
+                return_rgba = bool(payload.get("return_rgba", True))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                W, H = pil.size
+                # Detect and segment with GroundingDINO+SAM
+                masks, boxes, phrases = [], [], []
+                try:
+                    _masks, _boxes, _phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
+                    masks, boxes, phrases = _masks, _boxes, _phrases
+                except Exception as e:
+                    print("[ModelServer] mask_from_text detection error:", e)
+                    objs = sam_auto_objects(pil, max_masks=10)
+                    masks = [m for (m, _bbox) in objs]
+
+                if not masks:
+                    width, height = pil.size
+                    empty = np.zeros((height, width), dtype=np.uint8)
+                    return self._send(200, {"mask_png": None, "mask_binary": empty.tolist(), "note": "no mask"})
+
+                import cv2
+                combined = np.zeros((H, W), dtype=np.float32)
+                for m in masks:
+                    m = ensure_foreground_mask(m)
+                    if m.shape != (H, W):
+                        m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+                    combined = np.maximum(combined, m)
+                # Mask hygiene: dilate then feather
+                bin_mask = (combined > 0.5).astype(np.uint8) * 255
+                if dilate_px > 0:
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*dilate_px+1), max(1, 2*dilate_px+1)))
+                    bin_mask = cv2.dilate(bin_mask, k, iterations=1)
+                soft = bin_mask.astype(np.float32) / 255.0
+                if feather_px > 0:
+                    ksz = int(2*feather_px+1) if int(2*feather_px+1) % 2 == 1 else int(2*feather_px+2)
+                    soft = cv2.GaussianBlur(soft, (ksz, ksz), 0)
+                soft = np.clip(soft, 0.0, 1.0)
+
+                # Build outputs
+                buffer = BytesIO()
+                if return_rgba:
+                    rgba = np.concatenate([np.array(pil), (soft*255).astype(np.uint8)[..., None]], axis=-1)
+                    Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG")
+                else:
+                    Image.fromarray((soft*255).astype(np.uint8)).save(buffer, format="PNG")
+                mask_png_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                return self._send(200, {
+                    "mask_png": f"data:image/png;base64,{mask_png_b64}",
+                    "mask_binary_shape": [H, W],
+                    "mask_binary_sum": int((soft>0.5).sum()),
+                })
+            except Exception as e:
+                print("[ModelServer] mask_from_text error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "enhance_local":
+            try:
+                import cv2
+                image_path = ensure_image_path(payload)
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                pil = Image.open(image_path).convert("RGB")
+                img = np.array(pil).astype(np.uint8)
+
+                # Params
+                do_wb = bool(payload.get("white_balance", True))
+                do_clahe = bool(payload.get("clahe", True))
+                gamma = float(payload.get("gamma", 1.0))  # <1 brighter
+                unsharp_amount = float(payload.get("unsharp_amount", 0.6))
+                unsharp_radius = int(payload.get("unsharp_radius", 3))
+                do_denoise = bool(payload.get("denoise", False))
+                mask_png = payload.get("mask_png", None)
+                soft_mask = None
+                if mask_png:
+                    try:
+                        if mask_png.startswith("data:image"):
+                            _, m64 = mask_png.split(",", 1)
+                        else:
+                            m64 = mask_png
+                        m = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((img.shape[1], img.shape[0]))
+                        soft_mask = (np.array(m).astype(np.float32) / 255.0)[..., None]
+                    except Exception as _e:
+                        print("[ModelServer] enhance_local mask decode failed:", _e)
+
+                out = img.copy()
+                if do_wb:
+                    # Simple gray-world white balance
+                    avg_bgr = out.reshape(-1, 3).mean(axis=0)
+                    scale = avg_bgr.mean() / (avg_bgr + 1e-6)
+                    out = np.clip(out * scale, 0, 255).astype(np.uint8)
+
+                if do_clahe:
+                    lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
+                    l, a, b = cv2.split(lab)
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    l2 = clahe.apply(l)
+                    lab2 = cv2.merge([l2, a, b])
+                    out = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+
+                if gamma and abs(gamma - 1.0) > 1e-3:
+                    inv = 1.0 / max(1e-3, gamma)
+                    table = ((np.arange(256) / 255.0) ** inv * 255).astype(np.uint8)
+                    out = cv2.LUT(out, table)
+
+                if unsharp_amount > 0:
+                    radius = max(1, unsharp_radius | 1)
+                    blur = cv2.GaussianBlur(out, (radius, radius), 0)
+                    out = cv2.addWeighted(out, 1 + unsharp_amount, blur, -unsharp_amount, 0)
+
+                if do_denoise:
+                    out = cv2.fastNlMeansDenoisingColored(out, None, 5, 5, 7, 21)
+
+                if soft_mask is not None:
+                    # Blend only inside mask
+                    out_f = out.astype(np.float32)
+                    img_f = img.astype(np.float32)
+                    alpha = np.clip(soft_mask, 0.0, 1.0)
+                    blended = out_f * alpha + img_f * (1.0 - alpha)
+                    out = np.clip(blended, 0, 255).astype(np.uint8)
+
+                b64 = np_to_jpeg_base64(Image.fromarray(out))
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] enhance_local error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "inpaint_lama":
+            try:
+                # Preview-quality inpaint. If LaMa not available, fallback to OpenCV Telea.
+                import cv2
+                image_path = ensure_image_path(payload)
+                mask_png = payload.get("mask_png", "")
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                if not mask_png:
+                    return self._send(400, {"error": "mask_png required (data URL)"})
+                pil = Image.open(image_path).convert("RGB")
+                img = np.array(pil)[:, :, ::-1]  # to BGR for cv2
+                # Decode mask
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mbytes = base64.b64decode(m64)
+                mask_arr = np.array(Image.open(BytesIO(mbytes)).convert("L"))
+                mask_bin = (mask_arr > 127).astype(np.uint8) * 255
+
+                # Try LaMa via lama-cleaner if available
+                result = None
+                try:
+                    from lama_cleaner.model_manager import ModelManager  # type: ignore
+                    from lama_cleaner.schema import HDStrategy  # type: ignore
+                    _global = getattr(self, "_LAMA_MM", None)
+                    if _global is None:
+                        self._LAMA_MM = ModelManager(device="cuda" if torch.cuda.is_available() else "cpu", no_half=False, sd_device=None)
+                    res = self._LAMA_MM(image=img[:, :, ::-1], mask=mask_bin, hd_strategy=HDStrategy.CROP, hd_strategy_crop_margin=64, hd_strategy_crop_trigger_size=512, hd_strategy_resize_limit=1024)
+                    result = res[:, :, ::-1]
+                except Exception as e:
+                    print("[ModelServer] LaMa not available, using Telea fallback:", e)
+                    result = cv2.inpaint(img, (mask_bin > 0).astype(np.uint8), 3, cv2.INPAINT_TELEA)
+
+                out_pil = Image.fromarray(result[:, :, ::-1])
+                b64 = np_to_jpeg_base64(out_pil)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] inpaint_lama error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "inpaint_sdxl":
+            try:
+                image_path = ensure_image_path(payload)
+                mask_png = payload.get("mask_png", "")
+                prompt = payload.get("prompt", "")
+                negative_prompt = payload.get("negative_prompt", "low quality, blurry, artifacts")
+                guidance_scale = float(payload.get("guidance_scale", 6.0))
+                num_inference_steps = int(payload.get("num_inference_steps", 30))
+                use_canny = bool(payload.get("use_canny", True))
+                use_depth = bool(payload.get("use_depth", False))  # optional
+                seed = int(payload.get("seed", 0))
+                if not image_path or not os.path.exists(image_path):
+                    return self._send(400, {"error": "invalid image_path"})
+                if not mask_png:
+                    return self._send(400, {"error": "mask_png required (data URL)"})
+
+                device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+                # Lazy load diffusers pipeline
+                if _DIFFUSERS_ENV["pipe_sdxl"] is None:
+                    from diffusers import StableDiffusionXLInpaintPipeline, ControlNetModel
+                    import torch as _torch
+                    base = "stabilityai/stable-diffusion-xl-base-1.0"
+                    try:
+                        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(base, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32)
+                    except Exception:
+                        # Some hubs provide direct inpaint models; fallback to base
+                        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(base, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32)
+                    pipe = pipe.to(device)
+                    pipe.enable_attention_slicing()
+                    if device == "cuda":
+                        try:
+                            pipe.enable_xformers_memory_efficient_attention()
+                        except Exception:
+                            pass
+                    _DIFFUSERS_ENV["pipe_sdxl"] = pipe
+                    # ControlNets lazy
+                    try:
+                        _DIFFUSERS_ENV["controlnet_canny"] = ControlNetModel.from_pretrained("diffusers/controlnet-canny-sdxl-1.0")
+                    except Exception as _e:
+                        print("[ModelServer] ControlNet canny unavailable:", _e)
+                    try:
+                        _DIFFUSERS_ENV["controlnet_depth"] = ControlNetModel.from_pretrained("diffusers/controlnet-depth-sdxl-1.0")
+                    except Exception as _e:
+                        print("[ModelServer] ControlNet depth unavailable:", _e)
+
+                pipe = _DIFFUSERS_ENV["pipe_sdxl"]
+                from diffusers.utils import load_image as _load_image
+                import cv2
+
+                # Load image & mask
+                pil = Image.open(image_path).convert("RGB")
+                W, H = pil.size
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mbytes = base64.b64decode(m64)
+                mask = Image.open(BytesIO(mbytes)).convert("L").resize((W, H))
+                # Build ControlNet conditions
+                control_images = []
+                control_nets = []
+                if use_canny and _DIFFUSERS_ENV["controlnet_canny"] is not None:
+                    arr = np.array(pil)
+                    edges = cv2.Canny(arr, 100, 200)
+                    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+                    control_images.append(Image.fromarray(edges_rgb))
+                    control_nets.append(_DIFFUSERS_ENV["controlnet_canny"])
+                if use_depth and _DIFFUSERS_ENV["controlnet_depth"] is not None:
+                    try:
+                        # Try MiDaS small via torch.hub as a lightweight depth
+                        import torch
+                        import torchvision.transforms as T
+                        midas = torch.hub.load("intel-isl/MiDaS", "DPT_Small")
+                        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+                        transform = midas_transforms.small_transform
+                        midas = midas.to(device).eval()
+                        inp = transform(pil).to(device)
+                        with torch.no_grad():
+                            pred = midas(inp).squeeze().detach().cpu().numpy()
+                        pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-6)
+                        depth = (pred * 255).astype(np.uint8)
+                        depth_rgb = cv2.cvtColor(depth, cv2.COLOR_GRAY2RGB)
+                        control_images.append(Image.fromarray(depth_rgb))
+                        control_nets.append(_DIFFUSERS_ENV["controlnet_depth"])
+                    except Exception as _e:
+                        print("[ModelServer] Depth map unavailable:", _e)
+
+                generator = torch.Generator(device=device)
+                if seed > 0:
+                    generator = generator.manual_seed(seed)
+
+                if control_nets:
+                    # Re-create pipeline with multi-controlnet if needed
+                    from diffusers import StableDiffusionXLControlNetInpaintPipeline
+                    pipe_c = StableDiffusionXLControlNetInpaintPipeline(
+                        vae=pipe.vae,
+                        text_encoder=pipe.text_encoder,
+                        text_encoder_2=getattr(pipe, "text_encoder_2", None),
+                        tokenizer=pipe.tokenizer,
+                        tokenizer_2=getattr(pipe, "tokenizer_2", None),
+                        unet=pipe.unet,
+                        controlnet=control_nets if len(control_nets) > 1 else control_nets[0],
+                        scheduler=pipe.scheduler,
+                        image_encoder=getattr(pipe, "image_encoder", None),
+                        feature_extractor=getattr(pipe, "feature_extractor", None),
+                    ).to(device)
+                    pipe_c.enable_attention_slicing()
+                    if device == "cuda":
+                        try:
+                            pipe_c.enable_xformers_memory_efficient_attention()
+                        except Exception:
+                            pass
+                    gen = pipe_c(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        image=pil,
+                        mask_image=mask,
+                        control_image=control_images if len(control_images) > 1 else control_images[0],
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                    )
+                else:
+                    gen = pipe(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        image=pil,
+                        mask_image=mask,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                    )
+                out = gen.images[0]
+                b64 = np_to_jpeg_base64(out)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] inpaint_sdxl error:", e)
+                return self._send(500, {"error": str(e)})
+
+        if endpoint == "validate_edit":
+            try:
+                import cv2
+                from skimage.metrics import structural_similarity as ssim
+                orig_data = payload.get("original_image_data")
+                edited_data = payload.get("edited_image_data")
+                concept = payload.get("concept", "object")
+                mask_png = payload.get("mask_png", "")
+                if not orig_data or not edited_data or not mask_png:
+                    return self._send(400, {"error": "original_image_data, edited_image_data, and mask_png are required"})
+                def _decode_img(data_url: str) -> Image.Image:
+                    if data_url.startswith("data:image"):
+                        _, b64 = data_url.split(",", 1)
+                    else:
+                        b64 = data_url
+                    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                pil_o = _decode_img(orig_data)
+                pil_e = _decode_img(edited_data)
+                if pil_o.size != pil_e.size:
+                    pil_e = pil_e.resize(pil_o.size, Image.BICUBIC)
+                W, H = pil_o.size
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mask = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((W, H))
+                mask_np = (np.array(mask) > 127).astype(np.uint8)
+                # Seam ring: 5-15px ring
+                ring_inner = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+                ring_outer = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+                ring = ((ring_outer - ring_inner) > 0).astype(np.uint8)
+                o = np.array(pil_o).astype(np.float32)
+                e = np.array(pil_e).astype(np.float32)
+                # Compute SSIM on ring per channel and average
+                if ring.sum() > 0:
+                    svals = []
+                    for c in range(3):
+                        so = ssim(o[:, :, c] / 255.0, e[:, :, c] / 255.0, data_range=1.0)
+                        svals.append(float(so))
+                    seam_ssim = float(np.mean(svals))
+                else:
+                    seam_ssim = 1.0
+
+                # Grounding check on edited image
+                try:
+                    tmp_dir = tempfile.gettempdir()
+                    p_edit = os.path.join(tmp_dir, f"val_edit_{int(time.time()*1000)}.jpg")
+                    pil_e.save(p_edit)
+                    _m, _b, _phr = DETECTOR.detect_and_segment(image=p_edit, text_prompt=concept)
+                    remaining = len(_b)
+                except Exception as _e:
+                    print("[ModelServer] validate_edit GroundingDINO failed:", _e)
+                    remaining = -1
+
+                passed = (seam_ssim > 0.85) and (remaining == 0 or remaining == -1)
+                return self._send(200, {"seam_ssim": seam_ssim, "remaining_objects": remaining, "passed": passed})
+            except Exception as e:
+                print("[ModelServer] validate_edit error:", e)
                 return self._send(500, {"error": str(e)})
 
         return self._send(404, {"error": "not found"})

@@ -79,6 +79,10 @@ export async function POST(_req: NextRequest) {
     console.log("[Warmup] Starting Grounded-SAM warmup...")
     await runPy(["run_detect_all.py", img, "--prompt", "object"]) 
     console.log("[Warmup] Grounded-SAM warmup done")
+    // Lightly touch edit endpoints so weights download on H100 server
+    const base = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
+    try { await fetch(`${base}/prefetch_controlnet`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }) } catch {}
+    try { await fetch(`${base}/face_parse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image_data: null }) }) } catch {}
     warmedUp = true
     return NextResponse.json({ status: "ok", warmedUp: true })
   } catch (e: any) {

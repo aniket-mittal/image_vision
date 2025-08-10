@@ -4,6 +4,7 @@
 /testing_images/output
 /temp_images
 /temp_images/output
+/temp_output
 
 # Python cache files
 __pycache__/

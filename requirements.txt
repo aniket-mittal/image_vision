@@ -101,3 +101,5 @@ wcwidth==0.2.13
 xxhash @ file:///private/var/folders/nz/j6p8yfhx1mv_0grj5xl4650h0000gp/T/abs_4dqzb3ngyc/croot/python-xxhash_1737039922516/work
 yapf==0.43.0
 yarl @ file:///private/var/folders/k1/30mswbxs7r1g6zwn8y4fyt500000gp/T/abs_01an_nyy_6/croot/yarl_1732546853427/work
+diffusers==0.30.3
+lama-cleaner==1.3.0
