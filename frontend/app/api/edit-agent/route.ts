@@ -323,32 +323,32 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
     
     console.log(`[edit-agent] Processed image size: ${imageBuf.length} bytes, mask size: ${maskBuf.length} bytes`)
     
-    const form = new FormData()
-    form.append("prompt", prompt)
-    form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
-    form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
+  const form = new FormData()
+  form.append("prompt", prompt)
+  form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
+  form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
     
-    const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
-      method: "POST",
-      headers: { 
-        Authorization: `Bearer ${STABILITY_API_KEY}`,
-        Accept: "application/json"
-      },
-      body: form as any,
-    })
+  const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
+    method: "POST",
+    headers: { 
+      Authorization: `Bearer ${STABILITY_API_KEY}`,
+      Accept: "application/json"
+    },
+    body: form as any,
+  })
     
-    if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
+  if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
     
-    const contentType = r.headers.get("content-type") || ""
-    if (contentType.includes("application/json")) {
-      const j = await r.json()
-      const b64 = j?.artifacts?.[0]?.base64
-      if (!b64) throw new Error("stability: empty result")
-      return { processedImageData: `data:image/png;base64,${b64}` }
-    } else {
-      const arr = new Uint8Array(await r.arrayBuffer())
-      const b64 = Buffer.from(arr).toString("base64")
-      return { processedImageData: `data:image/png;base64,${b64}` }
+  const contentType = r.headers.get("content-type") || ""
+  if (contentType.includes("application/json")) {
+    const j = await r.json()
+    const b64 = j?.artifacts?.[0]?.base64
+    if (!b64) throw new Error("stability: empty result")
+    return { processedImageData: `data:image/png;base64,${b64}` }
+  } else {
+    const arr = new Uint8Array(await r.arrayBuffer())
+    const b64 = Buffer.from(arr).toString("base64")
+    return { processedImageData: `data:image/png;base64,${b64}` }
     }
   } catch (error) {
     console.error("[edit-agent] Stability AI inpainting failed:", error)
@@ -552,7 +552,7 @@ export async function POST(req: NextRequest) {
       console.log("[edit-agent] Mask generation response received")
       console.log("[edit-agent] Mask response keys:", Object.keys(mask))
       
-      if (!mask.mask_png) {
+    if (!mask.mask_png) {
         console.error("[edit-agent] Failed to build mask - no mask_png field")
         console.error("[edit-agent] Mask response:", mask)
         return NextResponse.json({ error: "Failed to build mask - no mask_png field" }, { status: 502 })
@@ -565,10 +565,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Invalid mask format" }, { status: 502 })
       }
       
-      console.log("[edit-agent] Mask built successfully, pixels:", mask.mask_binary_sum)
+    console.log("[edit-agent] Mask built successfully, pixels:", mask.mask_binary_sum)
       console.log("[edit-agent] Mask data URL length:", mask.mask_png.length)
       console.log("[edit-agent] Mask format:", mask.mask_png.substring(0, 50))
-      steps.push({ step: "mask", info: { pixels: mask.mask_binary_sum }, image: mask.mask_png })
+    steps.push({ step: "mask", info: { pixels: mask.mask_binary_sum }, image: mask.mask_png })
       
     } catch (maskError) {
       console.error("[edit-agent] Mask generation failed:", maskError)
@@ -603,13 +603,13 @@ export async function POST(req: NextRequest) {
       
       // Try validation but don't fail if it doesn't work
       try {
-        const val = await callModelServer("validate_edit", {
-          original_image_data: imageData,
-          edited_image_data: editedFb.processedImageData,
-          mask_png: refinedMask,
-          concept: intent.target || "object",
-        })
-        steps.push({ step: "validate", info: val })
+      const val = await callModelServer("validate_edit", {
+        original_image_data: imageData,
+        edited_image_data: editedFb.processedImageData,
+        mask_png: refinedMask,
+        concept: intent.target || "object",
+      })
+      steps.push({ step: "validate", info: val })
       } catch (validationError) {
         console.error(`[edit-agent] Preview validation failed:`, validationError)
         steps.push({ step: "validate", info: { error: "Validation failed", details: validationError instanceof Error ? validationError.message : String(validationError) } })
@@ -619,9 +619,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (aiModel === "SDXL") {
-      const prompt = intent.isReplace && intent.replacement
-        ? `Replace ${intent.target} with ${intent.replacement}`
-        : `Remove ${intent.target}`
+      // Use the user's instruction verbatim for adaptability
+      const prompt = instruction
       let params: any = { guidance_scale: 6.0, num_inference_steps: 30, use_canny: true, use_depth: false }
       let attempt = 0
       let best = null as any
@@ -630,11 +629,11 @@ export async function POST(req: NextRequest) {
         let val = null
         try {
           val = await callModelServer("validate_edit", {
-            original_image_data: imageData,
-            edited_image_data: out.processedImageData,
-            mask_png: refinedMask,
-            concept: intent.target || "object",
-          })
+          original_image_data: imageData,
+          edited_image_data: out.processedImageData,
+          mask_png: refinedMask,
+          concept: intent.target || "object",
+        })
         } catch (validationError) {
           console.error(`[edit-agent] SDXL validation failed:`, validationError)
           val = { passed: false, error: "Validation failed" }
@@ -652,15 +651,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (aiModel === "OpenAIImages") {
-      // Generate a more specific prompt for OpenAI
-      let prompt: string
-      if (intent.isReplace && intent.replacement) {
-        prompt = `Replace the ${intent.target} with a ${intent.replacement}, maintaining the same style and quality as the original image`
-      } else if (intent.isRemove) {
-        prompt = `Remove the ${intent.target} completely, fill the area naturally to match the surrounding environment`
-      } else {
-        prompt = `Edit the ${intent.target} according to the instruction: ${instruction}`
-      }
+      // Use the user's instruction verbatim for adaptability
+      const prompt: string = instruction
       
       console.log(`[edit-agent] Generated OpenAI prompt: "${prompt}"`)
       console.log(`[edit-agent] Starting OpenAI image edit...`)
@@ -669,21 +661,21 @@ export async function POST(req: NextRequest) {
       console.log(`[edit-agent] - Target: ${intent.target}`)
       
       try {
-        const out = await openAIImagesEdit(imageData, refinedMask, prompt)
+      const out = await openAIImagesEdit(imageData, refinedMask, prompt)
         console.log(`[edit-agent] OpenAI edit successful, result size: ${out.processedImageData.length} chars`)
-        steps.push({ step: "openai_images_edit", image: out.processedImageData })
+      steps.push({ step: "openai_images_edit", image: out.processedImageData })
         
         console.log(`[edit-agent] Attempting to validate edit result...`)
         let validationResult = null
         try {
-          const val = await callModelServer("validate_edit", {
-            original_image_data: imageData,
-            edited_image_data: out.processedImageData,
-            mask_png: refinedMask,
-            concept: intent.target || "object",
-          })
+      const val = await callModelServer("validate_edit", {
+        original_image_data: imageData,
+        edited_image_data: out.processedImageData,
+        mask_png: refinedMask,
+        concept: intent.target || "object",
+      })
           validationResult = val
-          steps.push({ step: "validate", info: val })
+      steps.push({ step: "validate", info: val })
           console.log(`[edit-agent] Validation complete:`, val)
         } catch (validationError) {
           console.error(`[edit-agent] Validation failed, but edit was successful:`, validationError)
@@ -692,7 +684,7 @@ export async function POST(req: NextRequest) {
           // Don't fail the entire request if validation fails
         }
         
-        return NextResponse.json({ ok: true, result: out.processedImageData, steps })
+      return NextResponse.json({ ok: true, result: out.processedImageData, steps })
       } catch (openaiError) {
         console.error(`[edit-agent] OpenAI edit failed:`, openaiError)
         const errorMessage = openaiError instanceof Error ? openaiError.message : String(openaiError)
@@ -704,17 +696,17 @@ export async function POST(req: NextRequest) {
       const prompt = intent.isReplace && intent.replacement
         ? `Replace ${intent.target} with ${intent.replacement}`
         : `Remove ${intent.target}`
-      const out = await stabilityInpaint(imageData, refinedMask, prompt)
+      const out = await stabilityInpaint(imageData, refinedMask, instruction)
       steps.push({ step: "stability_inpaint", image: out.processedImageData })
       let val = null
       try {
         val = await callModelServer("validate_edit", {
-          original_image_data: imageData,
-          edited_image_data: out.processedImageData,
-          mask_png: refinedMask,
-          concept: intent.target || "object",
-        })
-        steps.push({ step: "validate", info: val })
+        original_image_data: imageData,
+        edited_image_data: out.processedImageData,
+        mask_png: refinedMask,
+        concept: intent.target || "object",
+      })
+      steps.push({ step: "validate", info: val })
       } catch (validationError) {
         console.error(`[edit-agent] StabilityAI validation failed:`, validationError)
         steps.push({ step: "validate", info: { error: "Validation failed", details: validationError instanceof Error ? validationError.message : String(validationError) } })

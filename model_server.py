@@ -1532,7 +1532,16 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     m64 = mask_png
                 mbytes = base64.b64decode(m64)
-                mask = Image.open(BytesIO(mbytes)).convert("L").resize((W, H))
+                mimg = Image.open(BytesIO(mbytes))
+                # Prefer alpha channel if present; else grayscale
+                try:
+                    if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
+                        mask = mimg.split()[-1]
+                    else:
+                        mask = mimg.convert("L")
+                except Exception:
+                    mask = mimg.convert("L")
+                mask = mask.resize((W, H))
                 
                 # Build ControlNet conditions
                 control_images = []
