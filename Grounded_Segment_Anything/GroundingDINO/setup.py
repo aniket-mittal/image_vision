@@ -23,26 +23,22 @@
 import glob
 import os
 import subprocess
+
+import subprocess
 import sys
 
-# Try to import torch, but don't fail if it's not available
-# The user should install torch separately before installing this package
-try:
-    import torch
-    from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
-    TORCH_AVAILABLE = True
-except ImportError:
-    print("Warning: torch not found. Please install torch before installing GroundingDINO.")
-    print("You can install it with: pip install torch torchvision")
-    TORCH_AVAILABLE = False
-    # Create dummy classes to prevent setup from failing
-    class DummyExtension:
-        def __init__(self, *args, **kwargs):
-            pass
-    CppExtension = CUDAExtension = DummyExtension
-    CUDA_HOME = None
+def install_torch():
+    try:
+        import torch
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
 
+# Call the function to ensure torch is installed
+install_torch()
+
+import torch
 from setuptools import find_packages, setup
+from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
 
 # groundingdino version info
 version = "0.1.0"
@@ -66,19 +62,10 @@ def write_version_file():
 
 requirements = ["torch", "torchvision"]
 
-# Only try to get torch version if torch is available
-if TORCH_AVAILABLE:
-    torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
-else:
-    torch_ver = [0, 0]
+torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
 
 
 def get_extensions():
-    # If torch is not available, return None to skip extension compilation
-    if not TORCH_AVAILABLE:
-        print("Skipping extension compilation - torch not available")
-        return None
-        
     this_dir = os.path.dirname(os.path.abspath(__file__))
     extensions_dir = os.path.join(this_dir, "groundingdino", "models", "GroundingDINO", "csrc")
 
@@ -214,24 +201,6 @@ if __name__ == "__main__":
 
     write_version_file()
 
-    # Get extensions and cmdclass
-    ext_modules = get_extensions()
-    cmdclass = {}
-    
-    # Only add build_ext cmdclass if torch is available and extensions exist
-    if TORCH_AVAILABLE and ext_modules is not None:
-        try:
-            cmdclass["build_ext"] = torch.utils.cpp_extension.BuildExtension
-        except AttributeError:
-            print("Warning: torch.utils.cpp_extension.BuildExtension not available")
-    
-    # Parse requirements only if the file exists
-    try:
-        install_requires = parse_requirements("requirements.txt")
-    except FileNotFoundError:
-        print("Warning: requirements.txt not found, using default requirements")
-        install_requires = requirements
-
     setup(
         name="groundingdino",
         version="0.1.0",
@@ -239,13 +208,13 @@ if __name__ == "__main__":
         url="https://github.com/IDEA-Research/GroundingDINO",
         description="open-set object detector",
         license=license,
-        install_requires=install_requires,
+        install_requires=parse_requirements("requirements.txt"),
         packages=find_packages(
             exclude=(
                 "configs",
                 "tests",
             )
         ),
-        ext_modules=ext_modules,
-        cmdclass=cmdclass,
+        ext_modules=get_extensions(),
+        cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
     )

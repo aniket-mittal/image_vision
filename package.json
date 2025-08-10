@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "canvas": "^3.1.2",
+    "form-data": "^4.0.4"
+  }
+}

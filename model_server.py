@@ -211,18 +211,72 @@ def ensure_fba_loaded(device: str = None):
         if repo not in sys.path:
             sys.path.insert(0, repo)
         
-        # Try to import FBA with better error handling
+        # Try multiple import strategies for FBA
+        fba_module = None
+        import_errors = []
+        
+        # Strategy 1: Try direct import from nets
         try:
             from nets import FBA  # type: ignore
+            fba_module = FBA
+            print("[ModelServer] FBA imported successfully from nets")
         except ImportError as e:
-            print(f"[ModelServer] FBA import failed, trying alternative import: {e}")
-            # Try alternative import paths
+            import_errors.append(f"nets import failed: {e}")
+        
+        # Strategy 2: Try importing from nets subdirectory
+        if fba_module is None:
             try:
-                sys.path.insert(0, os.path.join(repo, "nets"))
+                nets_dir = os.path.join(repo, "nets")
+                if nets_dir not in sys.path:
+                    sys.path.insert(0, nets_dir)
                 from FBA import FBA  # type: ignore
-            except ImportError:
-                print("[ModelServer] FBA import failed, FBA Matting not available")
-                return None
+                fba_module = FBA
+                print("[ModelServer] FBA imported successfully from nets/FBA")
+            except ImportError as e:
+                import_errors.append(f"nets/FBA import failed: {e}")
+        
+        # Strategy 3: Try importing from the root of the repo
+        if fba_module is None:
+            try:
+                sys.path.insert(0, repo)
+                from FBA import FBA  # type: ignore
+                fba_module = FBA
+                print("[ModelServer] FBA imported successfully from repo root")
+            except ImportError as e:
+                import_errors.append(f"repo root import failed: {e}")
+        
+        # Strategy 4: Try installing missing dependencies and retry
+        if fba_module is None:
+            print("[ModelServer] All import strategies failed. Attempting to install missing dependencies...")
+            try:
+                import subprocess
+                import sys
+                
+                # Install required packages
+                packages = ["nets", "torch-scatter", "torch-sparse", "torch-cluster", "torch-spline-conv"]
+                for package in packages:
+                    try:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", package], 
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print(f"[ModelServer] Installed {package}")
+                    except subprocess.CalledProcessError:
+                        print(f"[ModelServer] Failed to install {package}")
+                
+                # Try importing again after installation
+                try:
+                    from nets import FBA  # type: ignore
+                    fba_module = FBA
+                    print("[ModelServer] FBA imported successfully after dependency installation")
+                except ImportError as e:
+                    import_errors.append(f"import after dependency installation failed: {e}")
+                    
+            except Exception as e:
+                import_errors.append(f"dependency installation failed: {e}")
+        
+        if fba_module is None:
+            print(f"[ModelServer] FBA import failed after all strategies. Errors: {import_errors}")
+            print("[ModelServer] FBA Matting not available - some features may be limited")
+            return None
         
         ckpt_dir = os.path.join(repo, "model")
         _ensure_dir(ckpt_dir)
@@ -251,7 +305,7 @@ def ensure_fba_loaded(device: str = None):
         
         # Load model with better error handling
         try:
-            net = FBA()
+            net = fba_module()
             checkpoint = torch.load(ckpt, map_location=device)
             net.load_state_dict(checkpoint)
             net.to(device).eval()
