@@ -1086,16 +1086,16 @@ class Handler(BaseHTTPRequestHandler):
                             img_t = to_tensor(image_scaled).unsqueeze(0)
                             trimap_t = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0)
                             
-                            # Apply FBA transformations
-                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0)
-                            image_transformed = normalise_image(img_t.clone())
-                            
-                            # Move to device - ensure ALL tensors are on the same device
+                            # Apply FBA transformations - create tensors directly on the correct device
                             device = next(net.parameters()).device
+                            
+                            # Create tensors directly on the correct device
+                            trimap_transformed = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device)
+                            image_transformed = normalise_image(img_t.clone()).to(device)
+                            
+                            # Move input tensors to device
                             img_t = img_t.to(device)
                             trimap_t = trimap_t.to(device)
-                            trimap_transformed = trimap_transformed.to(device)
-                            image_transformed = image_transformed.to(device)
                             
                             # Double-check all tensors are on the same device
                             try:
@@ -1507,7 +1507,9 @@ class Handler(BaseHTTPRequestHandler):
                             return self._send(500, {"error": f"Failed to load SDXL model: {e}"})
 
                 pipe = _DIFFUSERS_ENV["pipe_sdxl"]
-                device = next(pipe.parameters()).device
+                # Fix: StableDiffusionXLInpaintPipeline doesn't have parameters() method
+                # Use the device it was loaded on instead
+                device = pipe.device if hasattr(pipe, 'device') else "cuda" if torch.cuda.is_available() else "cpu"
 
                 # Load image & mask
                 pil = Image.open(image_path).convert("RGB")

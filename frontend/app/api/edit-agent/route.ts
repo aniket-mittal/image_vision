@@ -3,6 +3,7 @@ import { writeFile, mkdir } from "fs/promises"
 import { join } from "path"
 import { tmpdir } from "os"
 import { createCanvas, loadImage } from "canvas"
+import sharp from "sharp";
 
 const MODEL_SERVER_URL = (process.env.MODEL_SERVER_URL || "http://127.0.0.1:8765").replace(/\/+$/, "")
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
@@ -138,165 +139,148 @@ async function inpaintSDXL(imageData: string, maskPng: string, prompt: string, p
 }
 
 async function openAIImagesEdit(imageData: string, maskPng: string, prompt: string) {
-  // https://api.openai.com/v1/images/edits (multipart)
-  if (!OPENAI_API_KEY) {
-    console.error("[edit-agent] OPENAI_API_KEY is missing or empty")
-    throw new Error("OPENAI_API_KEY missing - please check your environment variables")
-  }
-  
-  // Validate API key format (should start with 'sk-')
-  if (!OPENAI_API_KEY.startsWith('sk-')) {
-    console.error("[edit-agent] OPENAI_API_KEY format appears invalid (should start with 'sk-')")
-    console.error("[edit-agent] This might be a false positive - your key may still work")
-    // Don't throw here, let the API call determine if the key is valid
-  }
-  
-  console.log(`[edit-agent] Using OpenAI API key: ${OPENAI_API_KEY.substring(0, 7)}...`)
-  
   try {
-    // Preprocess both image and mask to meet OpenAI requirements
-    console.log("[edit-agent] Preprocessing image and mask for OpenAI")
-    const processedImage = await preprocessImageForOpenAI(imageData)
-    const processedMask = await preprocessImageForOpenAI(maskPng)
-    
-    // Extract base64 data from processed images
-    const imageBuf = Buffer.from(processedImage.split(",")[1], "base64")
-    const maskBuf = Buffer.from(processedMask.split(",")[1], "base64")
-    
-    console.log(`[edit-agent] Processed image size: ${imageBuf.length} bytes, mask size: ${maskBuf.length} bytes`)
-    
-    // Validate mask format - OpenAI expects a black and white mask where white areas are edited
-    console.log("[edit-agent] Validating mask format...")
-    try {
-      const maskImg = await loadImage(maskBuf)
-      console.log(`[edit-agent] Mask dimensions: ${maskImg.width}x${maskImg.height}`)
-      
-      // Check if mask is roughly the right format by sampling some pixels
-      const tempCanvas = createCanvas(maskImg.width, maskImg.height)
-      const tempCtx = tempCanvas.getContext('2d')
-      tempCtx.drawImage(maskImg, 0, 0)
-      const imageData = tempCtx.getImageData(0, 0, maskImg.width, maskImg.height)
-      const pixels = imageData.data
-      
-      let whitePixels = 0
-      let blackPixels = 0
-      let otherPixels = 0
-      
-      for (let i = 0; i < pixels.length; i += 4) {
-        const r = pixels[i]
-        const g = pixels[i + 1]
-        const b = pixels[i + 2]
-        if (r > 200 && g > 200 && b > 200) whitePixels++
-        else if (r < 50 && g < 50 && b < 50) blackPixels++
-        else otherPixels++
-      }
-      
-      console.log(`[edit-agent] Mask pixel analysis: White (edit areas): ${whitePixels}, Black (preserve): ${blackPixels}, Other: ${otherPixels}`)
-      
-      if (whitePixels === 0) {
-        console.warn("[edit-agent] Warning: Mask appears to have no white areas (no areas to edit)")
-      }
-      if (blackPixels === 0) {
-        console.warn("[edit-agent] Warning: Mask appears to have no black areas (no areas to preserve)")
-      }
-      
-      // Ensure mask dimensions match image dimensions
-      const imageImg = await loadImage(imageBuf)
-      console.log(`[edit-agent] Image dimensions: ${imageImg.width}x${imageImg.height}`)
-      
-      if (maskImg.width !== imageImg.width || maskImg.height !== imageImg.height) {
-        console.warn(`[edit-agent] Warning: Mask dimensions (${maskImg.width}x${maskImg.height}) don't match image dimensions (${imageImg.width}x${imageImg.height})`)
-      }
-      
-    } catch (maskError) {
-      console.warn("[edit-agent] Could not analyze mask format:", maskError)
+    // Validate OpenAI API key
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    if (!openaiApiKey) {
+      throw new Error("OpenAI API key not configured");
     }
     
-    const form = new FormData()
-    form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
-    form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
-    form.append("prompt", prompt)
-    form.append("size", "1024x1024")
-    
-    console.log("[edit-agent] Sending request to OpenAI with:")
-    console.log(`[edit-agent] - Image size: ${imageBuf.length} bytes`)
-    console.log(`[edit-agent] - Mask size: ${maskBuf.length} bytes`)
-    console.log(`[edit-agent] - Prompt: "${prompt}"`)
-    console.log(`[edit-agent] - Size: 1024x1024`)
-    console.log(`[edit-agent] - Form data entries: ${Array.from(form.entries()).map(([k, v]) => `${k}: ${v instanceof Blob ? `${v.type} (${v.size} bytes)` : v}`).join(', ')}`)
-  
-    const r = await fetch("https://api.openai.com/v1/images/edits", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form as any,
-    })
-  
-    if (!r.ok) {
-      const errorText = await r.text()
-      console.error(`[edit-agent] OpenAI API error ${r.status}:`, errorText)
-      
-      // Handle common OpenAI API errors
-      if (r.status === 400) {
-        try {
-          const errorData = JSON.parse(errorText)
-          if (errorData.error?.message?.includes("image")) {
-            throw new Error(`OpenAI API: Image format/size issue - ${errorData.error.message}`)
-          } else if (errorData.error?.message?.includes("mask")) {
-            throw new Error(`OpenAI API: Mask format issue - ${errorData.error.message}`)
-          } else if (errorData.error?.message?.includes("prompt")) {
-            throw new Error(`OpenAI API: Prompt issue - ${errorData.error.message}`)
-          }
-        } catch (parseError) {
-          // If we can't parse the error, just use the raw text
-        }
-        throw new Error(`OpenAI API error (400): ${errorText}`)
-      } else if (r.status === 401) {
-        throw new Error("OpenAI API: Authentication failed - check your API key")
-      } else if (r.status === 429) {
-        throw new Error("OpenAI API: Rate limit exceeded - try again later")
-      } else if (r.status >= 500) {
-        throw new Error(`OpenAI API server error (${r.status}): ${errorText}`)
-      }
-      
-      throw new Error(`OpenAI API error ${r.status}: ${errorText}`)
+    // Log warning if key format looks suspicious (but don't fail)
+    if (!openaiApiKey.startsWith('sk-')) {
+      console.warn("OpenAI API key format looks suspicious - may cause API errors");
     }
-  
-    const data = await r.json()
-    console.log("[edit-agent] OpenAI API response:", JSON.stringify(data, null, 2))
+
+    console.log("Preprocessing image and mask for OpenAI");
     
-    // Check for different response formats
-    let b64 = data.data?.[0]?.b64_json
-    if (!b64) {
-      // Try alternative response format - OpenAI might return a URL instead of base64
-      b64 = data.data?.[0]?.url
-      if (b64) {
-        console.log("[edit-agent] Found URL in response, converting to base64")
-        try {
-          // Download the image and convert to base64
-          const imageResponse = await fetch(b64)
-          if (!imageResponse.ok) {
-            throw new Error(`Failed to download image from URL: ${imageResponse.status}`)
-          }
-          const imageBuffer = await imageResponse.arrayBuffer()
-          b64 = Buffer.from(imageBuffer).toString('base64')
-          console.log("[edit-agent] Successfully converted URL to base64")
-        } catch (downloadError) {
-          console.error("[edit-agent] Failed to download image from URL:", downloadError)
-          throw new Error(`Failed to download image from OpenAI URL: ${downloadError}`)
-        }
+    // Preprocess image to meet OpenAI requirements
+    const processedImage = await preprocessImageForOpenAI(imageData, 4 * 1024 * 1024);
+    let processedMask = await preprocessImageForOpenAI(maskPng, 4 * 1024 * 1024);
+    
+    console.log(`Processed image size: ${processedImage.length} chars, mask size: ${processedMask.length} chars`);
+    
+    // Validate mask format - ensure it's a proper binary mask
+    const maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
+    const maskImage = await sharp(maskBuffer);
+    const maskMetadata = await maskImage.metadata();
+    
+    console.log(`Mask dimensions: ${maskMetadata.width}x${maskMetadata.height}`);
+    
+    // Analyze mask pixels to ensure it's properly formatted
+    const maskPixels = await maskImage.raw().toBuffer();
+    let whitePixels = 0, blackPixels = 0, otherPixels = 0;
+    
+    for (let i = 0; i < maskPixels.length; i++) {
+      const pixel = maskPixels[i];
+      if (pixel === 255) whitePixels++;
+      else if (pixel === 0) blackPixels++;
+      else otherPixels++;
+    }
+    
+    console.log(`Mask pixel analysis: White (edit areas): ${whitePixels}, Black (preserve): ${blackPixels}, Other: ${otherPixels}`);
+    
+    // Ensure mask is binary (only black and white)
+    if (otherPixels > 0) {
+      console.warn("Mask contains non-binary pixels, converting to binary");
+      const binaryMask = await maskImage
+        .threshold(128) // Convert to binary
+        .png()
+        .toBuffer();
+      const binaryMaskBase64 = `data:image/png;base64,${binaryMask.toString('base64')}`;
+      processedMask = binaryMaskBase64;
+    }
+    
+    // Get original image dimensions for aspect ratio preservation
+    const imageBuffer = Buffer.from(processedImage.split(',')[1], 'base64');
+    const image = await sharp(imageBuffer);
+    const imageMetadata = await image.metadata();
+    
+    console.log(`Image dimensions: ${imageMetadata.width}x${imageMetadata.height}`);
+    
+    // Create FormData for OpenAI API
+    const formData = new FormData();
+    formData.append('image', new Blob([imageBuffer], { type: 'image/png' }), 'image.png');
+    formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+    formData.append('prompt', prompt);
+    formData.append('n', '1');
+    formData.append('size', '1024x1024'); // OpenAI edits always return 1024x1024
+    
+    console.log("Sending request to OpenAI with:");
+    console.log(`- Image size: ${imageBuffer.length} bytes`);
+    console.log(`- Mask size: ${maskBuffer.length} bytes`);
+    console.log(`- Prompt: "${prompt}"`);
+    console.log(`- Size: 1024x1024`);
+    
+    // Log form data entries for debugging
+    for (const [key, value] of formData.entries()) {
+      if (value instanceof Blob) {
+        console.log(`- Form data entries: ${key}: ${value.type} (${value.size} bytes)`);
+      } else {
+        console.log(`- Form data entries: ${key}: ${value}`);
       }
     }
     
-    if (!b64) {
-      console.error("[edit-agent] No image data found in response. Response structure:", data)
-      console.error("[edit-agent] Expected fields: data[0].b64_json or data[0].url")
-      throw new Error(`No image data in response. Response keys: ${Object.keys(data)}, data keys: ${data.data ? Object.keys(data.data[0] || {}) : 'no data'}`)
+    const response = await fetch('https://api.openai.com/v1/images/edits', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiApiKey}`,
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`OpenAI API error: ${response.status} - ${errorText}`);
+      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
     }
-    
-    return { processedImageData: `data:image/png;base64,${b64}` }
+
+    const data = await response.json();
+    console.log("OpenAI API response:", data);
+
+    let processedImageData: string;
+
+    if (data.data?.[0]?.b64_json) {
+      // Use base64 data if available
+      processedImageData = `data:image/png;base64,${data.data[0].b64_json}`;
+      console.log("OpenAI edit successful using b64_json");
+    } else if (data.data?.[0]?.url) {
+      // Download image from URL and convert to base64
+      console.log("Found URL in response, converting to base64");
+      const imageResponse = await fetch(data.data[0].url);
+      if (!imageResponse.ok) {
+        throw new Error(`Failed to download image from OpenAI URL: ${imageResponse.status}`);
+      }
+      
+      const imageBuffer = await imageResponse.arrayBuffer();
+      const base64 = Buffer.from(imageBuffer).toString('base64');
+      processedImageData = `data:image/png;base64,${base64}`;
+      console.log("Successfully converted URL to base64");
+    } else {
+      throw new Error("No image data in response");
+    }
+
+    // Post-process to restore original aspect ratio
+    if (imageMetadata.width && imageMetadata.height) {
+      const originalAspectRatio = imageMetadata.width / imageMetadata.height;
+      const targetWidth = 1024;
+      const targetHeight = Math.round(targetWidth / originalAspectRatio);
+      
+      // Resize the generated image to maintain aspect ratio
+      const resizedBuffer = await sharp(Buffer.from(processedImageData.split(',')[1], 'base64'))
+        .resize(targetWidth, targetHeight, { fit: 'fill' })
+        .png()
+        .toBuffer();
+      
+      processedImageData = `data:image/png;base64,${resizedBuffer.toString('base64')}`;
+      console.log(`Resized image to ${targetWidth}x${targetHeight} to maintain aspect ratio`);
+    }
+
+    console.log(`OpenAI edit successful, result size: ${processedImageData.length} chars`);
+    return { processedImageData };
+
   } catch (error) {
-    console.error("[edit-agent] OpenAI image edit failed:", error)
-    throw error
+    console.error("OpenAI Images API error:", error);
+    throw error;
   }
 }
 
