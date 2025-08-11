@@ -530,7 +530,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
           original_image_data: imageData,
           edited_image_data: processedImageData,
           mask_png: maskPng,
-          feather_px: 30,
+          feather_px: 32.5,
           pyramid_levels: 5,
           add_grain: false,
           expand_px: 24,
