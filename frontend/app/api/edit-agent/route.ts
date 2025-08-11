@@ -336,8 +336,8 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       // Convert binary white=edit to alpha hole with dynamic expansion to cover seams
       let binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
       try {
-        // Dynamically expand edit region ~1% of max dimension (clamped)
-        const expandPx = Math.max(4, Math.min(24, Math.round(Math.max(targetW, targetH) * 0.01)))
+        // Dynamically expand edit region ~2% of max dimension (clamped)
+        const expandPx = Math.max(8, Math.min(64, Math.round(Math.max(targetW, targetH) * 0.02)))
         const k = 2 * expandPx + 1
         const kernel = Array(k * k).fill(1)
         // Convolve (max-like) then threshold to achieve dilation

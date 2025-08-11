@@ -1386,7 +1386,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Expand edit region to cover potential mask under-detection
                 try:
-                    expand = int(payload.get("expand_px", 16))
+                    expand = int(payload.get("expand_px", 28))
                     if expand > 0:
                         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*expand+1, 2*expand+1))
                         mask_np = cv2.dilate(mask_np, k, iterations=1)
@@ -1480,8 +1480,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Match local color/contrast of edited region to surrounding ring
                 try:
-                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
-                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
+                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55)))
+                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (105, 105)))
                     ring = ((ring_out - ring_in) > 0)
                     for c in range(3):
                         region = out_np[:, :, c][mask_np > 127]
