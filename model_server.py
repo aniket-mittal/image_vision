@@ -1270,20 +1270,36 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 image_path = ensure_image_path(payload)
                 prompt = payload.get("prompt", "object")
-                dilate_px = int(payload.get("dilate_px", 3))
-                feather_px = int(payload.get("feather_px", 3))
+                dilate_px = int(payload.get("dilate_px", 2))  # Reduced default
+                feather_px = int(payload.get("feather_px", 2))  # Reduced default
                 return_rgba = bool(payload.get("return_rgba", True))
+                
+                # New parameters for better precision
+                box_threshold = float(payload.get("box_threshold", 0.45))  # Higher threshold for precision
+                text_threshold = float(payload.get("text_threshold", 0.35))  # Higher threshold for precision
+                enable_fba_refine = bool(payload.get("enable_fba_refine", False))
+                enable_controlnet = bool(payload.get("enable_controlnet", False))
+                
                 if not image_path or not os.path.exists(image_path):
                     return self._send(400, {"error": "invalid image_path"})
                 pil = Image.open(image_path).convert("RGB")
                 W, H = pil.size
-                # Detect and segment with GroundingDINO+SAM
+                
+                # Detect and segment with GroundingDINO+SAM using custom thresholds
                 masks, boxes, phrases = [], [], []
                 try:
-                    _masks, _boxes, _phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
+                    # Use the same DETECTOR but with custom thresholds for better precision
+                    _masks, _boxes, _phrases = DETECTOR.detect_and_segment(
+                        image=image_path, 
+                        text_prompt=prompt,
+                        box_threshold=box_threshold,
+                        text_threshold=text_threshold
+                    )
                     masks, boxes, phrases = _masks, _boxes, _phrases
+                    print(f"[ModelServer] mask_from_text: Found {len(masks)} masks with thresholds box={box_threshold}, text={text_threshold}")
                 except Exception as e:
-                    print("[ModelServer] mask_from_text detection error:", e)
+                    print(f"[ModelServer] mask_from_text detection error: {e}")
+                    # Fallback to auto-detection if GroundingDINO fails
                     objs = sam_auto_objects(pil, max_masks=10)
                     masks = [m for (m, _bbox) in objs]
 
@@ -1299,16 +1315,66 @@ class Handler(BaseHTTPRequestHandler):
                     if m.shape != (H, W):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
-                # Mask hygiene: dilate then feather
+                
+                # Mask hygiene: dilate then feather (reduced for precision)
                 bin_mask = (combined > 0.5).astype(np.uint8) * 255
                 if dilate_px > 0:
                     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*dilate_px+1), max(1, 2*dilate_px+1)))
                     bin_mask = cv2.dilate(bin_mask, k, iterations=1)
+                
                 soft = bin_mask.astype(np.float32) / 255.0
                 if feather_px > 0:
                     ksz = int(2*feather_px+1) if int(2*feather_px+1) % 2 == 1 else int(2*feather_px+2)
                     soft = cv2.GaussianBlur(soft, (ksz, ksz), 0)
                 soft = np.clip(soft, 0.0, 1.0)
+
+                # Optional FBA refinement for better edge quality
+                if enable_fba_refine:
+                    try:
+                        print("[ModelServer] mask_from_text: Attempting FBA refinement...")
+                        net = ensure_fba_loaded()
+                        if net is not None:
+                            # Convert PIL to numpy for FBA
+                            img_np = np.array(pil)
+                            
+                            # Create trimap from soft mask
+                            trimap = np.zeros((H, W, 2), dtype=np.float32)
+                            trimap[:, :, 0] = soft  # Foreground
+                            trimap[:, :, 1] = 1.0 - soft  # Background
+                            
+                            # Scale to multiple of 8 (FBA requirement)
+                            scale = 8
+                            h_scaled = ((H + scale - 1) // scale) * scale
+                            w_scaled = ((W + scale - 1) // scale) * scale
+                            
+                            img_scaled = cv2.resize(img_np, (w_scaled, h_scaled))
+                            trimap_scaled = cv2.resize(trimap, (w_scaled, h_scaled))
+                            
+                            # Convert to torch tensors
+                            img_tensor = torch.from_numpy(img_scaled).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                            trimap_tensor = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0).float()
+                            
+                            # Move to device
+                            device = next(net.parameters()).device
+                            img_tensor = img_tensor.to(device)
+                            trimap_tensor = trimap_tensor.to(device)
+                            
+                            # Run FBA refinement
+                            with torch.no_grad():
+                                refined_alpha = net(img_tensor, trimap_tensor, img_tensor, trimap_tensor)
+                                refined_alpha = refined_alpha.cpu().numpy()[0, 0]  # Extract alpha channel
+                            
+                            # Resize back to original dimensions
+                            refined_alpha = cv2.resize(refined_alpha, (W, H))
+                            refined_alpha = np.clip(refined_alpha, 0.0, 1.0)
+                            
+                            # Use refined alpha as the new soft mask
+                            soft = refined_alpha
+                            print("[ModelServer] mask_from_text: FBA refinement successful")
+                        else:
+                            print("[ModelServer] mask_from_text: FBA not available, skipping refinement")
+                    except Exception as e:
+                        print(f"[ModelServer] mask_from_text: FBA refinement failed: {e}")
 
                 # Build outputs
                 buffer = BytesIO()
@@ -1318,10 +1384,19 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     Image.fromarray((soft*255).astype(np.uint8)).save(buffer, format="PNG")
                 mask_png_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                
+                # Calculate mask statistics for debugging
+                mask_pixels = int((soft > 0.5).sum())
+                mask_coverage = mask_pixels / (W * H) * 100
+                print(f"[ModelServer] mask_from_text: Final mask has {mask_pixels} pixels ({mask_coverage:.1f}% coverage)")
+                
                 return self._send(200, {
                     "mask_png": f"data:image/png;base64,{mask_png_b64}",
                     "mask_binary_shape": [H, W],
-                    "mask_binary_sum": int((soft>0.5).sum()),
+                    "mask_binary_sum": mask_pixels,
+                    "mask_coverage_percent": mask_coverage,
+                    "thresholds_used": {"box": box_threshold, "text": text_threshold},
+                    "refinement": "fba" if enable_fba_refine else "none"
                 })
             except Exception as e:
                 print("[ModelServer] mask_from_text error:", e)
@@ -1343,6 +1418,12 @@ class Handler(BaseHTTPRequestHandler):
                 unsharp_amount = float(payload.get("unsharp_amount", 0.6))
                 unsharp_radius = int(payload.get("unsharp_radius", 3))
                 do_denoise = bool(payload.get("denoise", False))
+                
+                # New advanced lighting parameters
+                highlights = float(payload.get("highlights", 0.0))  # Highlight enhancement
+                shadows = float(payload.get("shadows", 0.0))  # Shadow enhancement
+                vibrance = float(payload.get("vibrance", 0.0))  # Color vibrance
+                
                 mask_png = payload.get("mask_png", None)
                 soft_mask = None
                 if mask_png:
@@ -1357,12 +1438,15 @@ class Handler(BaseHTTPRequestHandler):
                         print("[ModelServer] enhance_local mask decode failed:", _e)
 
                 out = img.copy()
+                
+                # White balance
                 if do_wb:
                     # Simple gray-world white balance
                     avg_bgr = out.reshape(-1, 3).mean(axis=0)
                     scale = avg_bgr.mean() / (avg_bgr + 1e-6)
                     out = np.clip(out * scale, 0, 255).astype(np.uint8)
 
+                # CLAHE for contrast enhancement
                 if do_clahe:
                     lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
                     l, a, b = cv2.split(lab)
@@ -1371,19 +1455,63 @@ class Handler(BaseHTTPRequestHandler):
                     lab2 = cv2.merge([l2, a, b])
                     out = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
 
+                # Gamma correction
                 if gamma and abs(gamma - 1.0) > 1e-3:
                     inv = 1.0 / max(1e-3, gamma)
                     table = ((np.arange(256) / 255.0) ** inv * 255).astype(np.uint8)
                     out = cv2.LUT(out, table)
 
+                # Unsharp masking
                 if unsharp_amount > 0:
                     radius = max(1, unsharp_radius | 1)
                     blur = cv2.GaussianBlur(out, (radius, radius), 0)
                     out = cv2.addWeighted(out, 1 + unsharp_amount, blur, -unsharp_amount, 0)
 
+                # Denoising
                 if do_denoise:
                     out = cv2.fastNlMeansDenoisingColored(out, None, 5, 5, 7, 21)
 
+                # Advanced lighting adjustments
+                if highlights > 0 or shadows > 0:
+                    # Convert to LAB for better control
+                    lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
+                    l, a, b = cv2.split(lab)
+                    
+                    # Create highlight and shadow masks
+                    l_norm = l.astype(np.float32) / 255.0
+                    
+                    if highlights > 0:
+                        # Enhance highlights (bright areas)
+                        highlight_mask = np.clip((l_norm - 0.6) * 2.5, 0, 1)  # Areas above 60% brightness
+                        highlight_enhancement = highlight_mask * highlights * 0.3
+                        l = np.clip(l + highlight_enhancement * 255, 0, 255).astype(np.uint8)
+                    
+                    if shadows > 0:
+                        # Enhance shadows (dark areas)
+                        shadow_mask = np.clip((0.4 - l_norm) * 2.5, 0, 1)  # Areas below 40% brightness
+                        shadow_enhancement = shadow_mask * shadows * 0.4
+                        l = np.clip(l + shadow_enhancement * 255, 0, 255).astype(np.uint8)
+                    
+                    # Reconstruct LAB and convert back to RGB
+                    lab_enhanced = cv2.merge([l, a, b])
+                    out = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+
+                # Vibrance enhancement
+                if vibrance > 0:
+                    # Convert to HSV for saturation control
+                    hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV)
+                    h, s, v = cv2.split(hsv)
+                    
+                    # Enhance saturation in less saturated areas
+                    s_norm = s.astype(np.float32) / 255.0
+                    saturation_boost = (1.0 - s_norm) * vibrance * 0.5
+                    s = np.clip(s + saturation_boost * 255, 0, 255).astype(np.uint8)
+                    
+                    # Reconstruct HSV and convert back to RGB
+                    hsv_enhanced = cv2.merge([h, s, v])
+                    out = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2RGB)
+
+                # Apply mask if provided
                 if soft_mask is not None:
                     # Blend only inside mask
                     out_f = out.astype(np.float32)

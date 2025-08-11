@@ -35,6 +35,24 @@ async function saveTempImage(imageData: string, basename = "edit_input.jpg") {
   return { imagePath, tempDir }
 }
 
+async function saveTempDataUrl(dataUrl: string, basename: string) {
+  const tempDir = join(tmpdir(), "image_vision_edit")
+  await mkdir(tempDir, { recursive: true })
+  const base64 = dataUrl.split(",")[1]
+  const buf = Buffer.from(base64, "base64")
+  const outPath = join(tempDir, `${Date.now()}_${basename}`)
+  await writeFile(outPath, buf)
+  return outPath
+}
+
+async function saveTempBuffer(buf: Buffer, basename: string) {
+  const tempDir = join(tmpdir(), "image_vision_edit")
+  await mkdir(tempDir, { recursive: true })
+  const outPath = join(tempDir, `${Date.now()}_${basename}`)
+  await writeFile(outPath, buf)
+  return outPath
+}
+
 async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, height?: number): Promise<Buffer> {
   // Ensure grayscale 8-bit mask
   let gray = await sharp(maskBuffer).greyscale().toBuffer();
@@ -122,8 +140,14 @@ async function buildMask(imagePath: string, imageData: string, prompt: string, o
   const body = {
     image_data: imageData,
     prompt,
-    dilate_px: opts?.dilate ?? 3,
-    feather_px: opts?.feather ?? 3,
+    dilate_px: opts?.dilate ?? 2,
+    feather_px: opts?.feather ?? 2,
+    // Use higher thresholds for more precise detection
+    box_threshold: 0.45,
+    text_threshold: 0.35,
+    // Enable advanced refinement
+    enable_fba_refine: true,
+    enable_controlnet: false, // Disable for edit mode to avoid conflicts
     return_rgba: true,
   }
   return callModelServer("mask_from_text", body) as Promise<{ mask_png: string; mask_binary_shape: number[]; mask_binary_sum: number }>
@@ -138,6 +162,8 @@ async function enhanceLocal(imagePath: string, imageData: string, params?: any) 
     unsharp_amount: params?.unsharp_amount ?? 0.5,
     unsharp_radius: params?.unsharp_radius ?? 3,
     denoise: params?.denoise ?? false,
+    // forward optional region mask when provided for targeted enhancement
+    ...(params?.mask_png ? { mask_png: params.mask_png } : {}),
   }
   return callModelServer("enhance_local", body) as Promise<{ processedImageData: string }>
 }
@@ -245,13 +271,26 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       }
     }
     
+    // Save debug artifacts
+    try {
+      await saveTempBuffer(imageBuffer, 'openai_input_image.png')
+      await saveTempBuffer(maskBuffer, 'openai_binary_mask.png')
+      await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
+    } catch (e) {
+      console.warn('Failed saving OpenAI debug artifacts:', e)
+    }
+
     const response = await fetch('https://api.openai.com/v1/images/edits', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${openaiApiKey}`,
+        'Accept': 'application/json',
       },
       body: formData,
-    });
+      // add a generous timeout to avoid header timeouts
+      duplex: 'half',
+      signal: AbortSignal.timeout(120000),
+    } as any);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -324,6 +363,12 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       console.log(`Composited generated content into masked region at ${targetWidth}x${targetHeight}`);
     }
 
+    // Save result for debugging
+    try {
+      await saveTempDataUrl(processedImageData, 'openai_result.png')
+    } catch (e) {
+      console.warn('Failed saving OpenAI result artifact:', e)
+    }
     console.log(`OpenAI edit successful, result size: ${processedImageData.length} chars`);
     return { processedImageData };
 
@@ -352,7 +397,17 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
   form.append("prompt", prompt)
   form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
   form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
+    // Optional tuning for better photorealism
+    form.append("output_format", "png")
     
+    // Save debug artifacts
+    try {
+      await saveTempBuffer(imageBuf, 'stability_input_image.png')
+      await saveTempBuffer(maskBuf, 'stability_input_mask.png')
+    } catch (e) {
+      console.warn('Failed saving Stability debug artifacts:', e)
+    }
+
     const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
       method: "POST",
       headers: { 
@@ -360,7 +415,9 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
         Accept: "application/json, image/*"
       },
       body: form as any,
-    })
+      duplex: 'half',
+      signal: AbortSignal.timeout(120000),
+    } as any)
     
     if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
     
@@ -385,7 +442,9 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
     // Image bytes
     const arr = new Uint8Array(await r.arrayBuffer())
     const b64 = Buffer.from(arr).toString("base64")
-    return { processedImageData: `data:image/png;base64,${b64}` }
+    const outUrl = `data:image/png;base64,${b64}`
+    try { await saveTempDataUrl(outUrl, 'stability_result.png') } catch {}
+    return { processedImageData: outUrl }
   } catch (error) {
     console.error("[edit-agent] Stability AI inpainting failed:", error)
     throw error
@@ -560,20 +619,49 @@ export async function POST(req: NextRequest) {
     // If lighting/tone -> local enhance
     if (intent.isLighting && !intent.isRemove && !intent.isReplace) {
       console.log("[edit-agent] Processing lighting enhancement")
-      // If face-related, get face mask and apply targeted enhancement
+      // If face-related, get face mask; else if a target is mentioned, build a target mask
       let maskPng: string | undefined = undefined
-      if (intent.mentionsFace) {
-        try {
+      try {
+        if (intent.mentionsFace) {
           console.log("[edit-agent] Getting face mask")
           const fp = await callFaceParse(imageData)
           maskPng = fp.face_mask_png
           steps.push({ step: "face_parse", image: maskPng })
-        } catch (error) {
-          console.error("[edit-agent] Face parse failed:", error)
+        } else if (intent.target && intent.target !== 'object') {
+          console.log("[edit-agent] Getting target mask for lighting:", intent.target)
+          const targetMask = await buildMask(imagePath, imageData, intent.target, { dilate: 1, feather: 3 })
+          maskPng = targetMask.mask_png
+          steps.push({ step: "lighting_target_mask", image: maskPng })
         }
+      } catch (e) {
+        console.warn("[edit-agent] Target mask for lighting failed, proceeding without:", e)
       }
-      console.log("[edit-agent] Enhancing image locally")
-      const enh = await enhanceLocal(imagePath, imageData, { gamma: 0.9, mask_png: maskPng })
+
+      // Map instruction to enhancement parameters
+      const t = instruction.toLowerCase()
+      const wantsBrighter = /(brighten|brighter|increase exposure|raise exposure|lighter|lighten|illuminate)/.test(t)
+      const wantsDarker = /(darken|darker|decrease exposure|lower exposure|dim|shade)/.test(t)
+      const wantsContrast = /(contrast|clarity|punch|vibrance|saturation)/.test(t)
+      const wantsDenoise = /(denoise|noise|grain|smooth|clean)/.test(t)
+      const wantsWhiteBalance = /(white balance|color balance|temperature|tint|warm|cool|neutral)/.test(t)
+      const wantsHighlights = /(highlights|specular|glow|shine)/.test(t)
+      const wantsShadows = /(shadows|shadow detail|dark areas)/.test(t)
+
+      const params = {
+        gamma: wantsBrighter ? 0.8 : wantsDarker ? 1.15 : 0.95,
+        clahe: wantsContrast || wantsHighlights || wantsShadows ? true : false,
+        unsharp_amount: wantsContrast ? 0.4 : wantsHighlights ? 0.25 : 0.15,
+        unsharp_radius: wantsContrast ? 4 : wantsHighlights ? 3 : 2,
+        denoise: wantsDenoise,
+        white_balance: wantsWhiteBalance,
+        // Add advanced lighting controls
+        highlights: wantsHighlights ? 0.3 : 0.0,
+        shadows: wantsShadows ? 0.4 : 0.0,
+        vibrance: wantsContrast ? 0.2 : 0.0,
+        mask_png: maskPng,
+      }
+      console.log("[edit-agent] Enhancing image locally with params:", params)
+      const enh = await enhanceLocal(imagePath, imageData, params)
       steps.push({ step: "enhance_local", image: enh.processedImageData })
       return NextResponse.json({ ok: true, result: enh.processedImageData, steps })
     }
@@ -584,11 +672,12 @@ export async function POST(req: NextRequest) {
     
     let mask: any
     try {
-      mask = await buildMask(imagePath, imageData, intent.target || "object", { dilate: 3, feather: 3 })
+      // Use more precise masking for object removal
+      mask = await buildMask(imagePath, imageData, intent.target || "object", { dilate: 1, feather: 2 })
       console.log("[edit-agent] Mask generation response received")
       console.log("[edit-agent] Mask response keys:", Object.keys(mask))
       
-    if (!mask.mask_png) {
+      if (!mask.mask_png) {
         console.error("[edit-agent] Failed to build mask - no mask_png field")
         console.error("[edit-agent] Mask response:", mask)
         return NextResponse.json({ error: "Failed to build mask - no mask_png field" }, { status: 502 })
@@ -601,10 +690,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Invalid mask format" }, { status: 502 })
       }
       
-    console.log("[edit-agent] Mask built successfully, pixels:", mask.mask_binary_sum)
+      console.log("[edit-agent] Mask built successfully, pixels:", mask.mask_binary_sum)
       console.log("[edit-agent] Mask data URL length:", mask.mask_png.length)
       console.log("[edit-agent] Mask format:", mask.mask_png.substring(0, 50))
-    steps.push({ step: "mask", info: { pixels: mask.mask_binary_sum }, image: mask.mask_png })
+      steps.push({ step: "mask", info: { pixels: mask.mask_binary_sum }, image: mask.mask_png })
       
     } catch (maskError) {
       console.error("[edit-agent] Mask generation failed:", maskError)
@@ -623,11 +712,19 @@ export async function POST(req: NextRequest) {
         refinedMask = r.refined_mask_png
         console.log("[edit-agent] Matting refine successful, using refined mask")
         steps.push({ step: "matting_refine", image: refinedMask })
+        try { await saveTempDataUrl(refinedMask, 'refined_mask.png') } catch {}
       } else {
         console.log("[edit-agent] Matting refine returned no refined mask, using original")
       }
     } catch (mattingError) {
       console.log("[edit-agent] Matting refine failed, using original mask:", mattingError instanceof Error ? mattingError.message : String(mattingError))
+    }
+
+    // Save the final mask being used for editing
+    try {
+      await saveTempDataUrl(refinedMask, 'final_edit_mask.png')
+    } catch (e) {
+      console.warn('Failed saving final edit mask:', e)
     }
 
     // Routing and execution
@@ -657,7 +754,15 @@ export async function POST(req: NextRequest) {
     if (aiModel === "SDXL") {
       // Use the user's instruction verbatim for adaptability
       const prompt = instruction
-      let params: any = { guidance_scale: 6.0, num_inference_steps: 30, use_canny: true, use_depth: false }
+      // Optimize SDXL parameters for object removal and natural fill
+      let params: any = { 
+        guidance_scale: 7.5, 
+        num_inference_steps: 40, 
+        use_canny: false, // Disable canny for more natural results
+        use_depth: false,
+        // Add negative prompts to avoid artifacts
+        negative_prompt: "low quality, blurry, artifacts, cartoon, illustration, anime, painting, cgi, 3d render, repetitive texture, pattern, watermark, text"
+      }
       let attempt = 0
       let best = null as any
       while (attempt < 2) {
@@ -665,11 +770,11 @@ export async function POST(req: NextRequest) {
         let val = null
         try {
           val = await callModelServer("validate_edit", {
-          original_image_data: imageData,
-          edited_image_data: out.processedImageData,
-          mask_png: refinedMask,
-          concept: intent.target || "object",
-        })
+            original_image_data: imageData,
+            edited_image_data: out.processedImageData,
+            mask_png: refinedMask,
+            concept: intent.target || "object",
+          })
         } catch (validationError) {
           console.error(`[edit-agent] SDXL validation failed:`, validationError)
           val = { passed: false, error: "Validation failed" }
@@ -680,7 +785,12 @@ export async function POST(req: NextRequest) {
         if (val.passed) { edited = out; break }
         // Retry: widen mask feather and adjust params
         attempt += 1
-        params = { ...params, guidance_scale: params.guidance_scale + 0.8, num_inference_steps: params.num_inference_steps + 10 }
+        params = { 
+          ...params, 
+          guidance_scale: params.guidance_scale + 1.0, 
+          num_inference_steps: params.num_inference_steps + 15,
+          use_canny: true // Enable canny on retry for better structure
+        }
       }
       if (!edited && best) edited = best.out
       return NextResponse.json({ ok: true, result: edited?.processedImageData || null, steps })
@@ -688,7 +798,10 @@ export async function POST(req: NextRequest) {
 
     if (aiModel === "OpenAIImages") {
       // Use the user's instruction verbatim for adaptability
-      const prompt: string = instruction
+      // Enhance prompt for better object removal and natural fill
+      const prompt: string = intent.isRemove 
+        ? `Remove ${intent.target} completely and fill the area naturally with the surrounding background, making it look like the ${intent.target} was never there`
+        : instruction
       
       console.log(`[edit-agent] Generated OpenAI prompt: "${prompt}"`)
       console.log(`[edit-agent] Starting OpenAI image edit...`)
@@ -697,21 +810,21 @@ export async function POST(req: NextRequest) {
       console.log(`[edit-agent] - Target: ${intent.target}`)
       
       try {
-      const out = await openAIImagesEdit(imageData, refinedMask, prompt)
+        const out = await openAIImagesEdit(imageData, refinedMask, prompt)
         console.log(`[edit-agent] OpenAI edit successful, result size: ${out.processedImageData.length} chars`)
-      steps.push({ step: "openai_images_edit", image: out.processedImageData })
+        steps.push({ step: "openai_images_edit", image: out.processedImageData })
         
         console.log(`[edit-agent] Attempting to validate edit result...`)
         let validationResult = null
         try {
-      const val = await callModelServer("validate_edit", {
-        original_image_data: imageData,
-        edited_image_data: out.processedImageData,
-        mask_png: refinedMask,
-        concept: intent.target || "object",
-      })
+          const val = await callModelServer("validate_edit", {
+            original_image_data: imageData,
+            edited_image_data: out.processedImageData,
+            mask_png: refinedMask,
+            concept: intent.target || "object",
+          })
           validationResult = val
-      steps.push({ step: "validate", info: val })
+          steps.push({ step: "validate", info: val })
           console.log(`[edit-agent] Validation complete:`, val)
         } catch (validationError) {
           console.error(`[edit-agent] Validation failed, but edit was successful:`, validationError)
@@ -720,7 +833,7 @@ export async function POST(req: NextRequest) {
           // Don't fail the entire request if validation fails
         }
         
-      return NextResponse.json({ ok: true, result: out.processedImageData, steps })
+        return NextResponse.json({ ok: true, result: out.processedImageData, steps })
       } catch (openaiError) {
         console.error(`[edit-agent] OpenAI edit failed:`, openaiError)
         const errorMessage = openaiError instanceof Error ? openaiError.message : String(openaiError)
@@ -729,20 +842,25 @@ export async function POST(req: NextRequest) {
     }
 
     if (aiModel === "StabilityAI") {
-      const prompt = intent.isReplace && intent.replacement
-        ? `Replace ${intent.target} with ${intent.replacement}`
-        : `Remove ${intent.target}`
-      const out = await stabilityInpaint(imageData, refinedMask, instruction)
+      // Enhance prompt for better object removal and natural fill
+      const prompt = intent.isRemove 
+        ? `Remove ${intent.target} completely and fill the area naturally with the surrounding background, making it look like the ${intent.target} was never there. High quality, photorealistic, seamless integration.`
+        : intent.isReplace && intent.replacement
+        ? `Replace ${intent.target} with ${intent.replacement}, high quality, photorealistic, seamless integration`
+        : instruction
+      
+      console.log(`[edit-agent] Generated Stability prompt: "${prompt}"`)
+      const out = await stabilityInpaint(imageData, refinedMask, prompt)
       steps.push({ step: "stability_inpaint", image: out.processedImageData })
       let val = null
       try {
         val = await callModelServer("validate_edit", {
-        original_image_data: imageData,
-        edited_image_data: out.processedImageData,
-        mask_png: refinedMask,
-        concept: intent.target || "object",
-      })
-      steps.push({ step: "validate", info: val })
+          original_image_data: imageData,
+          edited_image_data: out.processedImageData,
+          mask_png: refinedMask,
+          concept: intent.target || "object",
+        })
+        steps.push({ step: "validate", info: val })
       } catch (validationError) {
         console.error(`[edit-agent] StabilityAI validation failed:`, validationError)
         steps.push({ step: "validate", info: { error: "Validation failed", details: validationError instanceof Error ? validationError.message : String(validationError) } })
