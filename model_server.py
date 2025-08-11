@@ -1372,17 +1372,17 @@ class Handler(BaseHTTPRequestHandler):
                 # Prefer alpha channel if present; else luminance
                 try:
                     if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
-                        a = mimg.split()[-1]
-                        # Our pipeline uses alpha=0 inside edit hole. Convert to white=edit.
-                        mask_gray = Image.eval(a, lambda v: 255 - v)
+                        mask_gray = mimg.split()[-1]
                     else:
-                        # Grayscale masks are white=edit by convention
                         mask_gray = mimg.convert("L")
                 except Exception:
                     mask_gray = mimg.convert("L")
                 mask_gray = mask_gray.resize((W, H))
                 mask_np = np.array(mask_gray).astype(np.uint8)
-                # At this point, mask_np is white=edit. Do NOT auto-invert.
+                # Ensure 255 inside edit region (white means edit)
+                # If mask looks like alpha (0 in edit), invert
+                if mask_np.mean() < 127:
+                    mask_np = 255 - mask_np
 
                 # Optional: expand mask slightly to cover under-detection on thin extremities
                 try:
@@ -1394,7 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as _e_exp:
                     print("[ModelServer] mask expansion failed:", _e_exp)
 
-                # Distance-transform based feather for smooth, realistic seam (increase ~10%)
+                # Distance-transform based feather for smooth, realistic seam
                 try:
                     binm = (mask_np > 127).astype(np.uint8)
                     invm = 1 - binm
@@ -1405,9 +1405,9 @@ class Handler(BaseHTTPRequestHandler):
                     if ys.size and xs.size:
                         obj_w = max(1, int(xs.max() - xs.min()))
                         obj_h = max(1, int(ys.max() - ys.min()))
-                        k = max(int(feather_px * 1.1), int(0.022 * max(obj_w, obj_h)))
+                        k = max(feather_px, int(0.02 * max(obj_w, obj_h)))
                     else:
-                        k = int(feather_px * 1.1)
+                        k = feather_px
                     mask_soft_f = 1.0 / (1.0 + np.exp(-signed / max(1.0, float(k))))
                     # Build an alpha that is 1 in the core (far from edge), and soft only in a narrow seam band
                     core = (signed > float(k)).astype(np.uint8)
