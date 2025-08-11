@@ -68,6 +68,22 @@ async function saveTempBuffer(buf: Buffer, basename: string) {
   } catch {}
   return outPath
 }
+async function standardizeMaskAndGetCoverage(maskDataUrl: string, targetW: number, targetH: number) {
+  try {
+    const srcBuf = Buffer.from(maskDataUrl.split(',')[1] || '', 'base64')
+    const standardized = await buildTransparentMaskPng(srcBuf, targetW, targetH)
+    // compute coverage on standardized mask
+    const alphaForStats = await sharp(standardized).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
+    const { data } = await sharp(alphaForStats).raw().toBuffer({ resolveWithObject: true }) as any
+    let white = 0
+    for (let i = 0; i < data.length; i++) if (data[i] === 255) white++
+    return { standardized, white }
+  } catch (e) {
+    console.warn('[edit-agent] standardizeMaskAndGetCoverage failed:', e)
+    return { standardized: null as any, white: 0 }
+  }
+}
+
 
 async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, height?: number): Promise<Buffer> {
   // Standardize mask to: alpha = 0 in edit region, 255 elsewhere
@@ -76,34 +92,76 @@ async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, heigh
   const w = width || meta0.width || 1024
   const h = height || meta0.height || 1024
 
-  let editMaskFloat: Buffer
+  let finalAlpha: Buffer
   if (hasAlpha) {
-    // Extract alpha and interpret alpha=0 as edit region
+    // Extract alpha once
     const alphaResized = await sharp(maskBuffer)
       .ensureAlpha()
       .extractChannel('alpha')
       .resize(w, h, { fit: 'fill' })
       .toBuffer()
-    // Convert to white=edit for processing: edit = 255 - alpha
-    editMaskFloat = await sharp(alphaResized).linear(-1, 255).toBuffer()
+
+    // Candidate A: invert alpha (hole where object alpha exists)
+    const editA = await sharp(alphaResized).linear(-1, 255).blur(0.6).threshold(128).toBuffer()
+    const { data: rawA } = await sharp(editA).raw().toBuffer({ resolveWithObject: true }) as any
+    let whiteA = 0
+    for (let i = 0; i < rawA.length; i++) if (rawA[i] === 255) whiteA++
+
+    // Candidate B: use alpha as-is as white=edit
+    const editB = await sharp(alphaResized).blur(0.6).threshold(128).toBuffer()
+    const { data: rawB } = await sharp(editB).raw().toBuffer({ resolveWithObject: true }) as any
+    let whiteB = 0
+    for (let i = 0; i < rawB.length; i++) if (rawB[i] === 255) whiteB++
+
+    // Pick candidate with plausible coverage (not 0, not near total). Prefer the smaller plausible region.
+    const total = w * h
+    const goodA = whiteA > 0 && whiteA < total * 0.85
+    const goodB = whiteB > 0 && whiteB < total * 0.85
+    console.log(`[edit-agent] buildTransparentMaskPng(alpha): whiteA=${whiteA} whiteB=${whiteB} total=${total}`)
+
+    // Save candidates for debugging
+    try {
+      const tmpA = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 255, g: 255, b: 255 } } }).joinChannel(await sharp(editA).linear(-1, 255).toBuffer()).png().toBuffer()
+      await saveTempBuffer(tmpA, 'candidate_mask_A_invert_alpha.png')
+      const tmpB = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 255, g: 255, b: 255 } } }).joinChannel(await sharp(editB).linear(-1, 255).toBuffer()).png().toBuffer()
+      await saveTempBuffer(tmpB, 'candidate_mask_B_as_is_alpha.png')
+    } catch {}
+
+    let chosen: Buffer
+    if (goodA && goodB) {
+      chosen = (whiteA <= whiteB) ? editA : editB
+    } else if (goodA) {
+      chosen = editA
+    } else if (goodB) {
+      chosen = editB
+    } else {
+      // Fallback: pick the one with any coverage; if both invalid, use editA
+      chosen = whiteA > 0 ? editA : (whiteB > 0 ? editB : editA)
+    }
+    // Final alpha is inverse of white=edit
+    finalAlpha = await sharp(chosen).linear(-1, 255).toBuffer()
   } else {
     // Grayscale assumed white=edit
-    const gray = await sharp(maskBuffer).toColourspace('b-w').resize(w, h, { fit: 'fill' }).toBuffer()
-    editMaskFloat = gray
+    const gray = await sharp(maskBuffer).toColourspace('b-w').resize(w, h, { fit: 'fill' }).blur(0.6).threshold(128).toBuffer()
+    finalAlpha = await sharp(gray).linear(-1, 255).toBuffer()
   }
 
-  // Feather and binarize to clean edges
-  const editFeathered = await sharp(editMaskFloat).blur(0.6).threshold(128).toBuffer()
-
-  // Build final alpha where 0 in edit region
-  const finalAlpha = await sharp(editFeathered).linear(-1, 255).toBuffer()
-
-  // Debug: compute coverage
+  // Debug: compute coverage using resolved info (respect channels)
   try {
-    const raw = await sharp(editFeathered).raw().toBuffer()
+    const { data, info } = await sharp(editFeathered).raw().toBuffer({ resolveWithObject: true }) as any
     let countWhite = 0
-    for (let i = 0; i < raw.length; i++) if (raw[i] === 255) countWhite++
-    console.log(`[edit-agent] buildTransparentMaskPng: edit white pixels=${countWhite} of ${w*h}`)
+    const channels = info.channels || 1
+    if (channels === 1) {
+      for (let i = 0; i < data.length; i++) if (data[i] === 255) countWhite++
+    } else {
+      for (let i = 0; i < data.length; i += channels) {
+        // Treat pixel as white if any channel is 255
+        let isWhite = false
+        for (let c = 0; c < channels; c++) if (data[i + c] === 255) { isWhite = true; break }
+        if (isWhite) countWhite++
+      }
+    }
+    console.log(`[edit-agent] buildTransparentMaskPng: edit white pixels=${countWhite} of ${w*h} (channels=${channels})`)
   } catch {}
 
   const rgba = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 0, g: 0, b: 0 } } })
@@ -248,7 +306,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       console.warn("OpenAI API key format looks suspicious - may cause API errors");
     }
 
-    console.log("Preprocessing image and mask for OpenAI");
+      console.log("Preprocessing image and mask for OpenAI");
     
     // Preprocess image to meet OpenAI requirements (mask will be handled separately to preserve alpha)
     const processedImage = await preprocessImageForOpenAI(imageData, 4 * 1024 * 1024);
@@ -270,9 +328,12 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     // Always standardize the mask to "transparent where to edit"
     // This avoids pass-through of opaque RGBA masks (e.g., from matting_refine)
     let transparentMask: Buffer
+    let coverage = 0
     try {
-      transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
-      console.log('[edit-agent] Standardized mask to transparent-hole PNG for OpenAI')
+      const s = await standardizeMaskAndGetCoverage(maskPng, targetW, targetH)
+      transparentMask = s.standardized
+      coverage = s.white
+      console.log(`[edit-agent] Standardized mask coverage (pixels white/edit)=${coverage} of ${targetW*targetH}`)
     } catch (e) {
       console.warn('[edit-agent] Failed to standardize mask; attempting raw alpha path:', e)
       try {
@@ -288,22 +349,85 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     }
 
     // For statistics, analyze the binary edit mask used to create alpha (white=edit)
-    const editMaskForStats = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
-    const statsRaw = await sharp(editMaskForStats).raw().toBuffer()
-    let whitePixels = 0, blackPixels = 0
-    for (let i = 0; i < statsRaw.length; i++) {
-      const v = statsRaw[i]
-      if (v === 255) whitePixels++
-      else if (v === 0) blackPixels++
+    async function computeMaskStats(buf: Buffer) {
+      const alphaBuf = await sharp(buf).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
+      const { data, info } = await sharp(alphaBuf).raw().toBuffer({ resolveWithObject: true }) as any
+      let white = 0, black = 0
+      // alphaBuf is single-channel
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i]
+        if (v === 255) white++
+        else if (v === 0) black++
+      }
+      return { white, black }
+    }
+    let { white: whitePixels, black: blackPixels } = await computeMaskStats(transparentMask)
+    if (whitePixels === 0 && coverage > 0) {
+      // If coverage computed earlier indicates white>0, but alpha analysis shows 0, the alpha channel might be inverted.
+      console.warn('[edit-agent] Alpha analysis shows zero white but coverage earlier was >0; inverting alpha as fallback')
+      const invAlphaForStats = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
+      const invRGBA = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+        .joinChannel(invAlphaForStats)
+        .png()
+        .toBuffer()
+      const stats2 = await computeMaskStats(invRGBA)
+      if (stats2.white > 0) {
+        transparentMask = invRGBA
+        whitePixels = stats2.white
+        blackPixels = stats2.black
+      }
     }
     console.log(`Mask dimensions: ${targetW}x${targetH}`)
     console.log(`Mask pixel analysis: White(edit): ${whitePixels}, Black(keep): ${blackPixels}`)
+
+    // Fallbacks if coverage is zero (no edit region detected)
+    if (whitePixels === 0) {
+      console.warn('[edit-agent] Zero edit coverage after standardization; trying raw RGBA alpha path')
+      try {
+        const rawAlphaMask = await sharp(sourceMaskBuf).ensureAlpha().resize(targetW, targetH, { fit: 'fill' }).png().toBuffer()
+        let stats = await computeMaskStats(rawAlphaMask)
+        console.log(`[edit-agent] Raw alpha path stats: White(edit)=${stats.white}, Black=${stats.black}`)
+        if (stats.white > 0) {
+          transparentMask = rawAlphaMask
+          whitePixels = stats.white
+          blackPixels = stats.black
+        } else {
+          console.warn('[edit-agent] Raw alpha also zero; trying explicit inversion of alpha')
+          const invAlpha = await sharp(rawAlphaMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
+          const invRGBA = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+            .joinChannel(invAlpha)
+            .png()
+            .toBuffer()
+          stats = await computeMaskStats(invRGBA)
+          console.log(`[edit-agent] Inverted alpha stats: White(edit)=${stats.white}, Black=${stats.black}`)
+          if (stats.white > 0) {
+            transparentMask = invRGBA
+            whitePixels = stats.white
+            blackPixels = stats.black
+          }
+        }
+      } catch (e) {
+        console.warn('[edit-agent] Fallback rebuilds failed:', e)
+      }
+    }
 
     // Save debug artifacts
     try {
       await saveTempBuffer(imageBuffer, 'openai_input_image.png')
       await saveTempBuffer(sourceMaskBuf, 'openai_binary_mask_input.png')
       await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
+      // Also save server-provided debug binary, if available
+      try {
+        const maskedInfo = await callModelServer("mask_from_text", { image_data: imageData, prompt: "__noop__" })
+        if (maskedInfo?.debug_binary_mask_png) {
+          await saveTempDataUrl(maskedInfo.debug_binary_mask_png, 'openai_transparent_mask_binary_debug.png')
+        }
+      } catch {}
+      // Save alpha channel and binary for visual inspection
+      try {
+        const alphaCh = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').toBuffer()
+        await saveTempBuffer(alphaCh, 'openai_transparent_mask_alpha.png')
+      } catch {}
       const workspaceTempDir = join(process.cwd(), 'temp')
       await mkdir(workspaceTempDir, { recursive: true })
       await writeFile(join(workspaceTempDir, `${Date.now()}_openai_input_image.png`), imageBuffer)

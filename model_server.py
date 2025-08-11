@@ -1535,17 +1535,26 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:
                         print("[ModelServer] mask_from_text: FBA refinement failed:", e)
 
-                # Build transparent PNG mask: transparent where we want edits
+                # Build transparent PNG mask: transparent where we want edits (alpha=0 edit)
                 alpha = (soft * 255).astype(np.uint8)
                 edit_pixels = int((alpha > 127).sum())
                 keep_pixels = (W * H) - edit_pixels
                 print(f"[ModelServer] mask_from_text: alpha>127 edit_pixels={edit_pixels} keep_pixels={keep_pixels}")
+                # For clarity, we will encode BOTH an RGBA-transparent mask and a debug binary
                 rgb = np.zeros((H, W, 3), dtype=np.uint8)
                 rgba = np.dstack([rgb, 255 - alpha])  # 0 (transparent) at edit regions
                 out_pil = Image.fromarray(rgba, mode="RGBA")
                 buf = BytesIO()
                 out_pil.save(buf, format="PNG")
                 mask_png_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                # Debug binary mask (white=edit) for client sanity checks
+                try:
+                    bin_rgb = np.dstack([alpha, alpha, alpha])
+                    bin_buf = BytesIO()
+                    Image.fromarray(bin_rgb, mode="RGB").save(bin_buf, format="PNG")
+                    mask_bin_png_b64 = base64.b64encode(bin_buf.getvalue()).decode("utf-8")
+                except Exception:
+                    mask_bin_png_b64 = None
 
                 mask_pixels = int((alpha > 127).sum())
                 mask_coverage = round(100.0 * mask_pixels / (W * H), 2)
@@ -1554,7 +1563,8 @@ class Handler(BaseHTTPRequestHandler):
                     "mask_binary_shape": [H, W],
                     "mask_binary_sum": mask_pixels,
                     "mask_coverage_percent": mask_coverage,
-                    "refinement": "fba" if enable_fba_refine else "none"
+                    "refinement": "fba" if enable_fba_refine else "none",
+                    "debug_binary_mask_png": (f"data:image/png;base64,{mask_bin_png_b64}" if mask_bin_png_b64 else None)
                 })
             except Exception as e:
                 return self._send(500, {"error": str(e)})
