@@ -1334,47 +1334,39 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 image_path = ensure_image_path(payload)
                 prompt = payload.get("prompt", "object")
-                dilate_px = int(payload.get("dilate_px", 2))  # Reduced default
-                feather_px = int(payload.get("feather_px", 2))  # Reduced default
+                dilate_px = int(payload.get("dilate_px", 2))
+                feather_px = int(payload.get("feather_px", 2))
                 return_rgba = bool(payload.get("return_rgba", True))
                 
-                # New parameters for better precision
-                box_threshold = float(payload.get("box_threshold", 0.45))  # Higher threshold for precision
-                text_threshold = float(payload.get("text_threshold", 0.35))  # Higher threshold for precision
+                # Optional parameters (defaults align with Ask mode behavior)
+                box_threshold = payload.get("box_threshold", None)
+                text_threshold = payload.get("text_threshold", None)
                 enable_fba_refine = bool(payload.get("enable_fba_refine", False))
                 enable_controlnet = bool(payload.get("enable_controlnet", False))
-                keep_largest = bool(payload.get("keep_largest", True))
-                min_area_frac = float(payload.get("min_area_frac", 0.002))  # drop tiny specks
+                keep_largest = bool(payload.get("keep_largest", False))  # default off per request
+                min_area_frac = float(payload.get("min_area_frac", 0.0))
                 
                 if not image_path or not os.path.exists(image_path):
                     return self._send(400, {"error": "invalid image_path"})
                 pil = Image.open(image_path).convert("RGB")
                 W, H = pil.size
                 
-                # Detect and segment with GroundingDINO+SAM using custom thresholds
+                # Use the exact same detector used by Ask mode (GroundingDINO+SAM)
                 masks, boxes, phrases = [], [], []
                 try:
-                    _masks, _boxes, _phrases = DETECTOR.detect_and_segment(
-                        image=image_path,
-                        text_prompt=prompt,
-                        box_threshold=box_threshold,
-                        text_threshold=text_threshold,
-                    )
-                    # Select the single best detection by largest area (or highest score if provided later)
-                    if _masks:
-                        areas = []
-                        for m in _masks:
-                            m = ensure_foreground_mask(m)
-                            if m.shape != (H, W):
-                                import cv2 as _cv
-                                m = _cv.resize(m, (W, H), interpolation=_cv.INTER_NEAREST)
-                            areas.append(float((m > 0.5).sum()))
-                        idx = int(np.argmax(areas))
-                        masks, boxes, phrases = [_masks[idx]], [_boxes[idx]] if len(_boxes)>idx else [], [_phrases[idx]] if len(_phrases)>idx else []
-                    print(f"[ModelServer] mask_from_text: Using {len(masks)} best mask with thresholds box={box_threshold}, text={text_threshold}")
+                    if box_threshold is None or text_threshold is None:
+                        _masks, _boxes, _phrases = DETECTOR.detect_and_segment(
+                            image=image_path, text_prompt=prompt
+                        )
+                    else:
+                        _masks, _boxes, _phrases = DETECTOR.detect_and_segment(
+                            image=image_path, text_prompt=prompt,
+                            box_threshold=float(box_threshold), text_threshold=float(text_threshold)
+                        )
+                    masks, boxes, phrases = _masks, _boxes, _phrases
+                    print(f"[ModelServer] mask_from_text: Found {len(masks)} masks using GroundedDINO+SAM (Ask mode path)")
                 except Exception as e:
                     print(f"[ModelServer] mask_from_text detection error: {e}")
-                    # Fallback to auto-detection if GroundingDINO fails
                     objs = sam_auto_objects(pil, max_masks=10)
                     masks = [m for (m, _bbox) in objs]
 
@@ -1384,25 +1376,32 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"mask_png": None, "mask_binary": empty.tolist(), "note": "no mask"})
 
                 import cv2
+                
+                def _to_soft_mask(m: np.ndarray) -> np.ndarray:
+                    mm = m.astype(np.float32)
+                    if mm.ndim == 3 and mm.shape[0] == 1:
+                        mm = mm[0]
+                    mm = np.clip(mm, 0.0, 1.0)
+                    # DO NOT invert; rely on detector orientation exactly
+                    return mm
+                
                 combined = np.zeros((H, W), dtype=np.float32)
                 for m in masks:
-                    m = ensure_foreground_mask(m)
+                    m = _to_soft_mask(m)
                     if m.shape != (H, W):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
                 
-                # Binarize and keep the largest connected component to avoid scattered points
+                # Optional: keep only largest connected component if explicitly requested
                 bin_mask = (combined > 0.5).astype(np.uint8)
                 if keep_largest:
                     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
                     if num_labels > 1:
-                        # stats[0] is background
                         areas = stats[1:, cv2.CC_STAT_AREA]
                         max_i = int(np.argmax(areas)) + 1
-                        filtered = (labels == max_i).astype(np.uint8)
-                        bin_mask = filtered
+                        bin_mask = (labels == max_i).astype(np.uint8)
                 
-                # Remove tiny specks by area fraction threshold
+                # Optional: remove very small specks if requested
                 if min_area_frac > 0.0:
                     min_area = int(min_area_frac * W * H)
                     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
@@ -1412,7 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
                             keep[labels == i] = 1
                     bin_mask = keep
 
-                # Optional dilation and feathering for natural boundaries
+                # Dilation and feathering
                 if dilate_px > 0:
                     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*dilate_px+1), max(1, 2*dilate_px+1)))
                     bin_mask = cv2.dilate(bin_mask, k, iterations=1)
@@ -1422,24 +1421,21 @@ class Handler(BaseHTTPRequestHandler):
                     soft = cv2.GaussianBlur(soft, (ksz, ksz), 0)
                 soft = np.clip(soft, 0.0, 1.0)
 
-                # Optional FBA refinement for better edge quality
+                # Optional FBA refinement
                 if enable_fba_refine:
                     try:
                         print("[ModelServer] mask_from_text: Attempting FBA refinement...")
                         net = ensure_fba_loaded()
                         if net is not None:
-                            # Convert PIL to numpy for FBA
                             img_np = np.array(pil)
-                            # Create 3-channel trimap
                             trimap = np.zeros((H, W, 3), dtype=np.float32)
                             trimap[:, :, 0] = soft
                             trimap[:, :, 1] = 1.0 - soft
                             trimap[:, :, 2] = 0.0
-                            # Scale to multiple of 8
+                            import cv2 as _cv
                             scale = 8
                             h_scaled = ((H + scale - 1) // scale) * scale
                             w_scaled = ((W + scale - 1) // scale) * scale
-                            import cv2 as _cv
                             img_scaled = _cv.resize(img_np, (w_scaled, h_scaled))
                             trimap_scaled = _cv.resize(trimap, (w_scaled, h_scaled))
                             img_tensor = torch.from_numpy(img_scaled).permute(2, 0, 1).unsqueeze(0).float() / 255.0
@@ -1450,17 +1446,15 @@ class Handler(BaseHTTPRequestHandler):
                             with torch.no_grad():
                                 refined_alpha = net(img_tensor, trimap_tensor, img_tensor, trimap_tensor)
                             refined_alpha = refined_alpha.squeeze(0).squeeze(0).detach().cpu().numpy()
-                            refined_alpha = np.clip(refined_alpha, 0.0, 1.0)
-                            soft = refined_alpha
+                            soft = np.clip(refined_alpha, 0.0, 1.0)
                             print("[ModelServer] mask_from_text: FBA refinement applied")
                     except Exception as e:
                         print("[ModelServer] mask_from_text: FBA refinement failed:", e)
-                        # continue with soft
 
-                # Build PNG outputs
+                # Build transparent PNG mask: transparent where we want edits
                 alpha = (soft * 255).astype(np.uint8)
                 rgb = np.zeros((H, W, 3), dtype=np.uint8)
-                rgba = np.dstack([rgb, 255 - alpha])  # Transparent where edit should happen
+                rgba = np.dstack([rgb, 255 - alpha])  # 0 (transparent) at edit regions
                 out_pil = Image.fromarray(rgba, mode="RGBA")
                 buf = BytesIO()
                 out_pil.save(buf, format="PNG")
@@ -1473,7 +1467,6 @@ class Handler(BaseHTTPRequestHandler):
                     "mask_binary_shape": [H, W],
                     "mask_binary_sum": mask_pixels,
                     "mask_coverage_percent": mask_coverage,
-                    "thresholds_used": {"box": box_threshold, "text": text_threshold},
                     "refinement": "fba" if enable_fba_refine else "none"
                 })
             except Exception as e:
