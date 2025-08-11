@@ -1384,6 +1384,16 @@ class Handler(BaseHTTPRequestHandler):
                 if mask_np.mean() < 127:
                     mask_np = 255 - mask_np
 
+                # Expand edit region to cover potential mask under-detection
+                try:
+                    expand = int(payload.get("expand_px", 16))
+                    if expand > 0:
+                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*expand+1, 2*expand+1))
+                        mask_np = cv2.dilate(mask_np, k, iterations=1)
+                        print(f"[ModelServer] seamless_blend: expanded mask by {expand}px")
+                except Exception as _e_exp:
+                    print("[ModelServer] mask expansion failed:", _e_exp)
+
                 # Distance-transform based feather for smooth, realistic seam
                 try:
                     binm = (mask_np > 127).astype(np.uint8)

@@ -333,8 +333,21 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       } else {
         dbgBuf = sourceMaskBuf
       }
-      // Convert binary white=edit to alpha hole
-      const binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
+      // Convert binary white=edit to alpha hole with dynamic expansion to cover seams
+      let binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
+      try {
+        // Dynamically expand edit region ~1% of max dimension (clamped)
+        const expandPx = Math.max(4, Math.min(24, Math.round(Math.max(targetW, targetH) * 0.01)))
+        const k = 2 * expandPx + 1
+        const kernel = Array(k * k).fill(1)
+        // Convolve (max-like) then threshold to achieve dilation
+        const dilated = await sharp(binaryResized)
+          .convolve({ width: k, height: k, kernel })
+          .threshold(1)
+          .toBuffer()
+        binaryResized = dilated
+        console.log(`[edit-agent] Expanded edit region by ~${expandPx}px for robust inpainting`)
+      } catch {}
       const alphaHole = await sharp(binaryResized).linear(-1, 255).toBuffer() // alpha=255 outside, 0 inside
       transparentMask = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
         .joinChannel(alphaHole)
