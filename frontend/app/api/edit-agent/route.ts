@@ -506,18 +506,10 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       editAlpha = await sharp(editAlpha).blur(1.2).toBuffer()
       editAlpha = await sharp(editAlpha).threshold(56).toBuffer()
 
-      const genRGBA = await sharp(genResized)
-        .joinChannel(editAlpha)
-        .png()
-        .toBuffer();
-
-      const originalResized = await sharp(imageBuffer)
+      // Composite: start from original; overlay ONLY inside edit region using editAlpha as mask
+      const finalComposite = await sharp(imageBuffer)
         .resize(targetWidth, targetHeight, { fit: 'fill' })
-        .toBuffer();
-
-      const finalComposite = await sharp(originalResized)
-        .composite([{ input: genRGBA, blend: 'over' }])
-        // Strip any stray metadata and trim tiny 1px transparent borders if present
+        .composite([{ input: genResized, raw: undefined, blend: 'dest-over', mask: editAlpha } as any])
         .png({ progressive: false })
         .toBuffer();
 

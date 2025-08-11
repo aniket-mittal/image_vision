@@ -1379,10 +1379,22 @@ class Handler(BaseHTTPRequestHandler):
                     mask_gray = mimg.convert("L")
                 mask_gray = mask_gray.resize((W, H))
                 mask_np = np.array(mask_gray).astype(np.uint8)
-                # Ensure 255 inside edit region (white means edit)
-                # If mask looks like alpha (0 in edit), invert
-                if mask_np.mean() < 127:
-                    mask_np = 255 - mask_np
+                # Resolve orientation by comparing where the edit actually changed pixels
+                try:
+                    o_np = np.array(pil_o).astype(np.float32)
+                    e_np = np.array(pil_e).astype(np.float32)
+                    diff = np.mean(np.abs(e_np - o_np), axis=2)
+                    m_bin = (mask_np > 127).astype(np.uint8)
+                    inv_bin = 1 - m_bin
+                    s_in = float((diff * m_bin).sum())
+                    s_out = float((diff * inv_bin).sum())
+                    if s_out > s_in:
+                        mask_np = 255 - mask_np
+                        print(f"[ModelServer] seamless_blend: inverted mask by diff test (s_out {s_out:.1f} > s_in {s_in:.1f})")
+                    else:
+                        print(f"[ModelServer] seamless_blend: kept mask orientation (s_in {s_in:.1f} >= s_out {s_out:.1f})")
+                except Exception as _e_orient:
+                    print("[ModelServer] seamless_blend orientation test failed:", _e_orient)
 
                 # Optional: expand mask slightly to cover under-detection on thin extremities
                 try:
