@@ -179,7 +179,19 @@ async function buildMask(imagePath: string, imageData: string, prompt: string, o
     keep_largest: true,
     min_area_frac: 0.002,
   }
-  return callModelServer("mask_from_text", body) as Promise<{ mask_png: string; mask_binary_shape: number[]; mask_binary_sum: number }>
+  // Debug log on the server side for mask coverage
+  try {
+    const res = await callModelServer("mask_from_text", body) as any
+    if (res?.mask_binary_sum !== undefined && Array.isArray(res?.mask_binary_shape)) {
+      console.log(`[edit-agent] mask_from_text returned sum=${res.mask_binary_sum} shape=${res.mask_binary_shape}`)
+    } else {
+      console.log(`[edit-agent] mask_from_text returned keys:`, Object.keys(res || {}))
+    }
+    return res
+  } catch (e) {
+    console.error(`[edit-agent] mask_from_text failed:`, e)
+    throw e
+  }
 }
 
 async function enhanceLocal(imagePath: string, imageData: string, params?: any) {

@@ -1386,29 +1386,54 @@ class Handler(BaseHTTPRequestHandler):
 
                 import cv2
                 
-                def _to_soft_mask(m: np.ndarray) -> np.ndarray:
+                def _to_soft_mask(m: np.ndarray, idx: int) -> np.ndarray:
                     mm = m.astype(np.float32)
                     if mm.ndim == 3 and mm.shape[0] == 1:
                         mm = mm[0]
                     mm = np.clip(mm, 0.0, 1.0)
-                    # DO NOT invert; rely on detector orientation exactly
+                    mean_val = float(mm.mean())
+                    # Heuristic: if majority is selected (>0.5 avg), invert assuming background=1
+                    if mean_val > 0.5:
+                        mm = 1.0 - mm
+                        print(f"[ModelServer] mask_from_text: Inverted mask {idx} due to high mean={mean_val:.3f}")
+                    else:
+                        print(f"[ModelServer] mask_from_text: Kept mask {idx} mean={mean_val:.3f}")
                     return mm
                 
                 combined = np.zeros((H, W), dtype=np.float32)
-                for m in masks:
-                    m = _to_soft_mask(m)
+                for i, m in enumerate(masks):
+                    m = _to_soft_mask(m, i)
                     if m.shape != (H, W):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
                 
-                # Optional: keep only largest connected component if explicitly requested
-                bin_mask = (combined > 0.5).astype(np.uint8)
+                c_min, c_max, c_mean = float(combined.min()), float(combined.max()), float(combined.mean())
+                print(f"[ModelServer] mask_from_text: combined stats min={c_min:.3f} max={c_max:.3f} mean={c_mean:.3f}")
+
+                # Threshold adaptively (Otsu), fallback to percentile, then 0.5
+                try:
+                    _, bin_otsu = cv2.threshold((combined * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    bin_mask = (bin_otsu > 0).astype(np.uint8)
+                    print("[ModelServer] mask_from_text: Otsu threshold used")
+                except Exception as _e_thr:
+                    print("[ModelServer] mask_from_text: Otsu failed, using percentile/0.5:", _e_thr)
+                    try:
+                        thr = float(np.percentile(combined, 70.0))
+                        bin_mask = (combined >= thr).astype(np.uint8)
+                        print(f"[ModelServer] mask_from_text: Percentile thr={thr:.3f}")
+                    except Exception as _e_thr2:
+                        print("[ModelServer] mask_from_text: Percentile failed, using 0.5:", _e_thr2)
+                        bin_mask = (combined > 0.5).astype(np.uint8)
+
+                pre_cc = int(bin_mask.sum())
+                print(f"[ModelServer] mask_from_text: bin before filtering sum={pre_cc}")
                 if keep_largest:
                     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
                     if num_labels > 1:
                         areas = stats[1:, cv2.CC_STAT_AREA]
                         max_i = int(np.argmax(areas)) + 1
                         bin_mask = (labels == max_i).astype(np.uint8)
+                        print(f"[ModelServer] mask_from_text: kept largest component area={int(areas.max())}")
                 
                 # Optional: remove very small specks if requested
                 if min_area_frac > 0.0:
@@ -1419,6 +1444,7 @@ class Handler(BaseHTTPRequestHandler):
                         if stats[i, cv2.CC_STAT_AREA] >= min_area:
                             keep[labels == i] = 1
                     bin_mask = keep
+                    print(f"[ModelServer] mask_from_text: removed small components under {min_area} px")
 
                 # Dilation and feathering
                 if dilate_px > 0:
@@ -1429,6 +1455,26 @@ class Handler(BaseHTTPRequestHandler):
                     ksz = int(2*feather_px+1) if int(2*feather_px+1) % 2 == 1 else int(2*feather_px+2)
                     soft = cv2.GaussianBlur(soft, (ksz, ksz), 0)
                 soft = np.clip(soft, 0.0, 1.0)
+
+                post_sum = int((soft > 0.5).sum())
+                coverage_pct = round(100.0 * post_sum / (W * H), 2)
+                print(f"[ModelServer] mask_from_text: post-process sum={post_sum} ({coverage_pct}%)")
+
+                # If still empty, try invert or pick top saliency region
+                if post_sum == 0:
+                    alt = (1.0 - combined)
+                    try:
+                        _, bin_alt = cv2.threshold((alt * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        bin_alt = (bin_alt > 0).astype(np.uint8)
+                    except Exception:
+                        bin_alt = (alt > 0.5).astype(np.uint8)
+                    if bin_alt.sum() > 0:
+                        print("[ModelServer] mask_from_text: fallback invert produced non-empty mask")
+                        soft = bin_alt.astype(np.float32)
+                        if feather_px > 0:
+                            ksz = int(2*feather_px+1) if int(2*feather_px+1) % 2 == 1 else int(2*feather_px+2)
+                            soft = cv2.GaussianBlur(soft, (ksz, ksz), 0)
+                        soft = np.clip(soft, 0.0, 1.0)
 
                 # Optional FBA refinement
                 if enable_fba_refine:
@@ -1491,6 +1537,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Build transparent PNG mask: transparent where we want edits
                 alpha = (soft * 255).astype(np.uint8)
+                edit_pixels = int((alpha > 127).sum())
+                keep_pixels = (W * H) - edit_pixels
+                print(f"[ModelServer] mask_from_text: alpha>127 edit_pixels={edit_pixels} keep_pixels={keep_pixels}")
                 rgb = np.zeros((H, W, 3), dtype=np.uint8)
                 rgba = np.dstack([rgb, 255 - alpha])  # 0 (transparent) at edit regions
                 out_pil = Image.fromarray(rgba, mode="RGBA")
