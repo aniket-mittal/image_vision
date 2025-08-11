@@ -316,7 +316,6 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     }
 
     // Always standardize the mask to "transparent where to edit"
-    // This avoids pass-through of opaque RGBA masks (e.g., from matting_refine)
     // IMPORTANT: Use server-provided debug binary mask (white=edit), convert to transparent-hole
     let transparentMask: Buffer
     try {
@@ -335,7 +334,9 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       }
       // Convert binary white=edit to alpha hole
       const binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
-      const alphaHole = await sharp(binaryResized).linear(-1, 255).toBuffer() // alpha=255 outside, 0 inside
+      // Ensure mask is binary: threshold, then invert to hole
+      const binaryClean = await sharp(binaryResized).threshold(128).toBuffer()
+      const alphaHole = await sharp(binaryClean).linear(-1, 255).toBuffer() // alpha=255 outside, 0 inside
       transparentMask = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
         .joinChannel(alphaHole)
         .png()
@@ -394,7 +395,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       }
     }
 
-    // Save debug artifacts
+      // Save debug artifacts
     try {
       await saveTempBuffer(imageBuffer, 'openai_input_image.png')
       await saveTempBuffer(sourceMaskBuf, 'openai_binary_mask_input.png')
@@ -506,10 +507,18 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       editAlpha = await sharp(editAlpha).blur(1.2).toBuffer()
       editAlpha = await sharp(editAlpha).threshold(56).toBuffer()
 
-      // Composite: start from original; overlay ONLY inside edit region using editAlpha as mask
-      const finalComposite = await sharp(imageBuffer)
+      const genRGBA = await sharp(genResized)
+        .joinChannel(editAlpha)
+        .png()
+        .toBuffer();
+
+      const originalResized = await sharp(imageBuffer)
         .resize(targetWidth, targetHeight, { fit: 'fill' })
-        .composite([{ input: genResized, raw: undefined, blend: 'dest-over', mask: editAlpha } as any])
+        .toBuffer();
+
+      const finalComposite = await sharp(originalResized)
+        .composite([{ input: genRGBA, blend: 'over' }])
+        // Strip any stray metadata and trim tiny 1px transparent borders if present
         .png({ progressive: false })
         .toBuffer();
 
