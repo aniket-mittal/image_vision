@@ -1290,8 +1290,17 @@ class Handler(BaseHTTPRequestHandler):
                     _, m64 = mask_png.split(",", 1)
                 else:
                     m64 = mask_png
-                mask = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((W, H))
-                mask_np = (np.array(mask) > 127).astype(np.uint8)
+                mimg = Image.open(BytesIO(base64.b64decode(m64)))
+                try:
+                    if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
+                        mask_gray = mimg.split()[-1]
+                    else:
+                        mask_gray = mimg.convert("L")
+                except Exception:
+                    mask_gray = mimg.convert("L")
+                mask = mask_gray.resize((W, H))
+                # Build binary 1 inside edit region (alpha=0 means edit)
+                mask_np = (np.array(mask) < 128).astype(np.uint8)
                 # Seam ring: 5-15px ring
                 ring_inner = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
                 ring_outer = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
@@ -1531,8 +1540,28 @@ class Handler(BaseHTTPRequestHandler):
                             _, m64 = mask_png.split(",", 1)
                         else:
                             m64 = mask_png
-                        m = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((img.shape[1], img.shape[0]))
-                        soft_mask = (np.array(m).astype(np.float32) / 255.0)[..., None]
+                        mimg = Image.open(BytesIO(base64.b64decode(m64)))
+                        has_alpha = False
+                        # Prefer alpha channel if present; else use luminance
+                        try:
+                            if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
+                                alpha = mimg.split()[-1]
+                                has_alpha = True
+                            else:
+                                alpha = mimg.convert("L")
+                        except Exception:
+                            alpha = mimg.convert("L")
+                        alpha = alpha.resize((img.shape[1], img.shape[0]))
+                        alpha_np = np.array(alpha).astype(np.float32) / 255.0
+                        # If RGBA alpha provided, alpha=0 inside edit region → region mask = 1 - alpha
+                        # If grayscale provided (e.g., face_parse), assume white=edit region → region mask = grayscale
+                        region_np = (1.0 - alpha_np) if has_alpha else alpha_np
+                        soft_mask = region_np[..., None]
+                        # Light feathering for smooth blends
+                        try:
+                            soft_mask = cv2.GaussianBlur(soft_mask, (0, 0), 1.0)
+                        except Exception:
+                            pass
                     except Exception as _e:
                         print("[ModelServer] enhance_local mask decode failed:", _e)
 
@@ -1612,11 +1641,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Apply mask if provided
                 if soft_mask is not None:
-                    # Blend only inside mask
+                    # Blend only inside mask (soft_mask=1 means apply edit)
                     out_f = out.astype(np.float32)
                     img_f = img.astype(np.float32)
-                    alpha = np.clip(soft_mask, 0.0, 1.0)
-                    blended = out_f * alpha + img_f * (1.0 - alpha)
+                    alpha_blend = np.clip(soft_mask, 0.0, 1.0)
+                    blended = out_f * alpha_blend + img_f * (1.0 - alpha_blend)
                     out = np.clip(blended, 0, 255).astype(np.uint8)
 
                 b64 = np_to_jpeg_base64(Image.fromarray(out))
@@ -1752,8 +1781,11 @@ class Handler(BaseHTTPRequestHandler):
                 # Prefer alpha channel if present; else grayscale
                 try:
                     if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
-                        mask = mimg.split()[-1]
+                        mask_gray = mimg.split()[-1]
+                        # Our RGBA masks use alpha=0 at edit region; invert for SDXL (white=edit)
+                        mask = Image.eval(mask_gray, lambda v: 255 - v)
                     else:
+                        # Assume grayscale already has white=edit
                         mask = mimg.convert("L")
                 except Exception:
                     mask = mimg.convert("L")
@@ -1774,7 +1806,9 @@ class Handler(BaseHTTPRequestHandler):
                             )
                             try:
                                 cn = cn.to(device)
-                                cn.to(dtype=dtype)
+                                # Use UNet dtype as reference when available
+                                if hasattr(pipe, "unet") and hasattr(pipe.unet, "dtype"):
+                                    cn = cn.to(dtype=pipe.unet.dtype)
                             except Exception:
                                 cn = cn.to(device)
                             _DIFFUSERS_ENV["controlnet_canny"] = cn
@@ -1801,7 +1835,8 @@ class Handler(BaseHTTPRequestHandler):
                             )
                             try:
                                 cn_d = cn_d.to(device)
-                                cn_d.to(dtype=dtype)
+                                if hasattr(pipe, "unet") and hasattr(pipe.unet, "dtype"):
+                                    cn_d = cn_d.to(dtype=pipe.unet.dtype)
                             except Exception:
                                 cn_d = cn_d.to(device)
                             _DIFFUSERS_ENV["controlnet_depth"] = cn_d
@@ -1848,14 +1883,15 @@ class Handler(BaseHTTPRequestHandler):
                         feature_extractor=getattr(pipe, "feature_extractor", None),
                     ).to(device)
                     try:
+                        ref_dtype = pipe.unet.dtype if hasattr(pipe, "unet") and hasattr(pipe.unet, "dtype") else (torch.float16 if device == "cuda" else torch.float32)
                         if hasattr(pipe_c, "unet"):
-                            pipe_c.unet.to(dtype=dtype)
+                            pipe_c.unet.to(dtype=ref_dtype)
                         if hasattr(pipe_c, "vae"):
-                            pipe_c.vae.to(dtype=dtype)
+                            pipe_c.vae.to(dtype=ref_dtype)
                         if hasattr(pipe_c, "text_encoder") and pipe_c.text_encoder is not None:
-                            pipe_c.text_encoder.to(dtype=dtype)
+                            pipe_c.text_encoder.to(dtype=torch.float32)
                         if hasattr(pipe_c, "text_encoder_2") and getattr(pipe_c, "text_encoder_2", None) is not None:
-                            pipe_c.text_encoder_2.to(dtype=dtype)
+                            pipe_c.text_encoder_2.to(dtype=torch.float32)
                     except Exception as _e:
                         print(f"[ModelServer] Warning: could not standardize SDXL+ControlNet component dtypes: {_e}")
                     pipe_c.enable_attention_slicing()
@@ -1894,13 +1930,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Composite with soft alpha to avoid seams at edges
                 out_np = np.array(out).astype(np.float32)
                 orig_np = np.array(pil).astype(np.float32)
-                mask_gray = np.array(mask).astype(np.float32) / 255.0
-                # Feather slightly for smoother boundaries
+                # Build alpha for compositing: 1 inside edit region
+                mask_inpaint = np.array(mask).astype(np.float32) / 255.0
+                # Slight feather for smooth blend
                 try:
-                    mask_gray = cv2.GaussianBlur(mask_gray, (5, 5), 0)
+                    mask_inpaint = cv2.GaussianBlur(mask_inpaint, (5, 5), 0)
                 except Exception:
                     pass
-                alpha = np.clip(mask_gray[..., None], 0.0, 1.0)
+                alpha = np.clip(mask_inpaint[..., None], 0.0, 1.0)
                 comp_np = out_np * alpha + orig_np * (1.0 - alpha)
                 comp_np = np.clip(comp_np, 0, 255).astype(np.uint8)
                 comp_img = Image.fromarray(comp_np)
@@ -1929,14 +1966,26 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 m64 = mask_png
             mbytes = base64.b64decode(m64)
-            mask = Image.open(BytesIO(mbytes)).convert("L").resize((W, H))
+            mimg = Image.open(BytesIO(mbytes))
+            # Prefer alpha if present, else luminance
+            try:
+                if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
+                    mask_gray = mimg.split()[-1]
+                else:
+                    mask_gray = mimg.convert("L")
+            except Exception:
+                mask_gray = mimg.convert("L")
+            mask = mask_gray.resize((W, H))
             
             # Convert to numpy arrays
             image_np = np.array(pil)
-            mask_np = np.array(mask)
+            mask_np = np.array(mask).astype(np.float32) / 255.0
+            # OpenCV inpaint needs white=to fill; convert from alpha semantics (alpha=0 edit)
+            # Our mask is 1.0 where edit region after conversion above. Build uint8 0/255
+            mask_bin = (mask_np > 0.5).astype(np.uint8) * 255
             
             # Use OpenCV inpainting as fallback
-            result = cv2_inpaint_fallback(image_np, mask_np)
+            result = cv2_inpaint_fallback(image_np, mask_bin)
             
             # Convert back to PIL and encode
             result_pil = Image.fromarray(result)

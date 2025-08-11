@@ -172,9 +172,6 @@ async function buildMask(imagePath: string, imageData: string, prompt: string, o
     prompt,
     dilate_px: opts?.dilate ?? 2,
     feather_px: opts?.feather ?? 2,
-    // Use higher thresholds for more precise detection
-    box_threshold: 0.55,
-    text_threshold: 0.45,
     // Enable advanced refinement
     enable_fba_refine: true,
     enable_controlnet: false, // Disable for edit mode to avoid conflicts
@@ -232,27 +229,45 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
 
     console.log("Preprocessing image and mask for OpenAI");
     
-    // Preprocess image to meet OpenAI requirements
+    // Preprocess image to meet OpenAI requirements (mask will be handled separately to preserve alpha)
     const processedImage = await preprocessImageForOpenAI(imageData, 4 * 1024 * 1024);
-    let processedMask = await preprocessImageForOpenAI(maskPng, 4 * 1024 * 1024);
-    
-    console.log(`Processed image size: ${processedImage.length} chars, mask size: ${processedMask.length} chars`);
-    
-    // Decode buffers
     const imageBuffer = Buffer.from(processedImage.split(',')[1], 'base64');
-    let maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
 
-    // Determine final size for mask (match processed image)
-    const imageMeta = await sharp(imageBuffer).metadata()
-    const targetW = imageMeta.width || 1024
-    const targetH = imageMeta.height || Math.round(targetW / 1.0)
+    // Compute original dimensions once and reuse
+    const imageMetadata = await sharp(imageBuffer).metadata();
+    const targetW = imageMetadata.width || 1024;
+    const targetH = imageMetadata.height || Math.round(targetW / 1.0);
 
-    // Build transparent PNG mask using alpha if present
-    const transparentMask = await buildTransparentMaskPng(maskBuffer, targetW, targetH)
+    // Build transparent PNG mask using server-provided maskPng WITHOUT canvas preprocessing to keep alpha
+    let sourceMaskBuf: Buffer
+    if (maskPng.startsWith('data:image')) {
+      sourceMaskBuf = Buffer.from(maskPng.split(',')[1], 'base64')
+    } else {
+      sourceMaskBuf = Buffer.from(maskPng, 'base64')
+    }
 
-    // For statistics, analyze the binary edit mask (white=edit) used to create alpha
+    // If the mask already has an alpha channel, prefer it directly; otherwise construct one
+    let transparentMask: Buffer
+    try {
+      const srcMeta = await sharp(sourceMaskBuf).metadata()
+      if ((srcMeta.channels || 0) >= 4 && srcMeta.hasAlpha) {
+        transparentMask = await sharp(sourceMaskBuf)
+          .ensureAlpha()
+          .resize(targetW, targetH, { fit: 'fill' })
+          .png()
+          .toBuffer()
+        console.log(`[edit-agent] Using alpha from server mask (channels=${srcMeta.channels})`)
+      } else {
+        transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
+        console.log(`[edit-agent] Built transparent mask from grayscale server mask (channels=${srcMeta.channels})`)
+      }
+    } catch (e) {
+      console.warn('[edit-agent] Mask metadata read failed; rebuilding:', e)
+      transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
+    }
+
+    // For statistics, analyze the binary edit mask used to create alpha (white=edit)
     const editMaskForStats = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
-    const statsMeta = await sharp(editMaskForStats).metadata()
     const statsRaw = await sharp(editMaskForStats).raw().toBuffer()
     let whitePixels = 0, blackPixels = 0
     for (let i = 0; i < statsRaw.length; i++) {
@@ -266,7 +281,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     // Save debug artifacts
     try {
       await saveTempBuffer(imageBuffer, 'openai_input_image.png')
-      await saveTempBuffer(maskBuffer, 'openai_binary_mask_input.png')
+      await saveTempBuffer(sourceMaskBuf, 'openai_binary_mask_input.png')
       await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
       const workspaceTempDir = join(process.cwd(), 'temp')
       await mkdir(workspaceTempDir, { recursive: true })
@@ -284,13 +299,13 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     formData.append('prompt', prompt);
     formData.append('n', '1');
     formData.append('size', '1024x1024');
-    
+
     console.log("Sending request to OpenAI with:");
     console.log(`- Image size: ${imageBuffer.length} bytes`);
     console.log(`- Mask size: ${transparentMask.length} bytes`);
     console.log(`- Prompt: "${prompt}"`);
     console.log(`- Size: 1024x1024`);
-    
+
     // Log form data entries for debugging
     for (const [key, value] of formData.entries()) {
       if (value instanceof Blob) {
@@ -298,20 +313,6 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       } else {
         console.log(`- Form data entries: ${key}: ${value}`);
       }
-    }
-    
-    // Save debug artifacts
-    try {
-      await saveTempBuffer(imageBuffer, 'openai_input_image.png')
-      await saveTempBuffer(maskBuffer, 'openai_binary_mask.png')
-      await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
-      // Also dump a copy of the exact payload images in workspace temp
-      const workspaceTempDir = join(process.cwd(), 'temp')
-      await mkdir(workspaceTempDir, { recursive: true })
-      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_input_image.png`), imageBuffer)
-      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_mask_transparent.png`), transparentMask)
-    } catch (e) {
-      console.warn('Failed saving OpenAI debug artifacts:', e)
     }
 
     const response = await fetch('https://api.openai.com/v1/images/edits', {
@@ -321,7 +322,6 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         'Accept': 'application/json',
       },
       body: formData,
-      // add a generous timeout to avoid header timeouts
       duplex: 'half',
       signal: AbortSignal.timeout(120000),
     } as any);
@@ -338,19 +338,16 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     let processedImageData: string;
 
     if (data.data?.[0]?.b64_json) {
-      // Use base64 data if available
       processedImageData = `data:image/png;base64,${data.data[0].b64_json}`;
       console.log("OpenAI edit successful using b64_json");
     } else if (data.data?.[0]?.url) {
-      // Download image from URL and convert to base64
       console.log("Found URL in response, converting to base64");
       const imageResponse = await fetch(data.data[0].url);
       if (!imageResponse.ok) {
         throw new Error(`Failed to download image from OpenAI URL: ${imageResponse.status}`);
       }
-      
-      const imageBuffer = await imageResponse.arrayBuffer();
-      const base64 = Buffer.from(imageBuffer).toString('base64');
+      const arrBuf = await imageResponse.arrayBuffer();
+      const base64 = Buffer.from(arrBuf).toString('base64');
       processedImageData = `data:image/png;base64,${base64}`;
       console.log("Successfully converted URL to base64");
     } else {
@@ -368,22 +365,19 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
 
-      // Resize mask to original aspect ratio dimensions and prepare as 8-bit alpha
-      const maskAlpha = await sharp(maskBuffer)
+      // Resize mask alpha to original aspect ratio dimensions
+      const maskAlpha = await sharp(transparentMask)
+        .ensureAlpha()
+        .extractChannel('alpha')
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .threshold(128)
-        .toColourspace('b-w')
-        .ensureAlpha() // guarantees an alpha channel exists
-        .removeAlpha() // keep single channel grayscale
         .toBuffer();
 
-      // Build RGBA for generated image using mask as alpha
       const genRGBA = await sharp(genResized)
-        .joinChannel(maskAlpha) // maskAlpha used as alpha channel
+        .joinChannel(maskAlpha)
         .png()
         .toBuffer();
 
-      // Composite: gen over original using alpha so only masked region is replaced
       const originalResized = await sharp(imageBuffer)
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
@@ -839,17 +833,11 @@ export async function POST(req: NextRequest) {
       
       console.log(`[edit-agent] Generated OpenAI prompt: "${prompt}"`)
       console.log(`[edit-agent] Starting OpenAI image edit...`)
-      console.log(`[edit-agent] - Original image size: ${imageData.length} chars`)
-      console.log(`[edit-agent] - Mask size: ${refinedMask.length} chars`)
-      console.log(`[edit-agent] - Target: ${intent.target}`)
       
       try {
         const out = await openAIImagesEdit(imageData, refinedMask, prompt)
-        console.log(`[edit-agent] OpenAI edit successful, result size: ${out.processedImageData.length} chars`)
         steps.push({ step: "openai_images_edit", image: out.processedImageData })
-        
-        console.log(`[edit-agent] Attempting to validate edit result...`)
-        let validationResult = null
+        // Optionally run validation without failing the request
         try {
           const val = await callModelServer("validate_edit", {
             original_image_data: imageData,
@@ -857,70 +845,35 @@ export async function POST(req: NextRequest) {
             mask_png: refinedMask,
             concept: intent.target || "object",
           })
-          validationResult = val
           steps.push({ step: "validate", info: val })
-          console.log(`[edit-agent] Validation complete:`, val)
         } catch (validationError) {
-          console.error(`[edit-agent] Validation failed, but edit was successful:`, validationError)
-          const errorMessage = validationError instanceof Error ? validationError.message : String(validationError)
-          steps.push({ step: "validate", info: { error: "Validation failed", details: errorMessage } })
-          // Don't fail the entire request if validation fails
+          steps.push({ step: "validate", info: { error: validationError instanceof Error ? validationError.message : String(validationError) } })
         }
-        
         return NextResponse.json({ ok: true, result: out.processedImageData, steps })
-      } catch (openaiError) {
-        console.error(`[edit-agent] OpenAI edit failed:`, openaiError)
-        const errorMessage = openaiError instanceof Error ? openaiError.message : String(openaiError)
-        throw new Error(`OpenAI image edit failed: ${errorMessage}`)
+      } catch (openAIError) {
+        console.error("OpenAI Images API error:", openAIError);
+        return NextResponse.json({ error: `OpenAI API error: ${openAIError instanceof Error ? openAIError.message : String(openAIError)}` }, { status: 502 });
       }
     }
 
     if (aiModel === "StabilityAI") {
-      // Enhance prompt for better object removal and natural fill
-      const prompt = intent.isRemove 
-        ? `Remove ${intent.target} completely and fill the area naturally with the surrounding background, making it look like the ${intent.target} was never there. High quality, photorealistic, seamless integration.`
-        : intent.isReplace && intent.replacement
-        ? `Replace ${intent.target} with ${intent.replacement}, high quality, photorealistic, seamless integration`
-        : instruction
-      
-      console.log(`[edit-agent] Generated Stability prompt: "${prompt}"`)
-      const out = await stabilityInpaint(imageData, refinedMask, prompt)
-      steps.push({ step: "stability_inpaint", image: out.processedImageData })
-      let val = null
       try {
-        val = await callModelServer("validate_edit", {
-          original_image_data: imageData,
-          edited_image_data: out.processedImageData,
-          mask_png: refinedMask,
-          concept: intent.target || "object",
-        })
-        steps.push({ step: "validate", info: val })
-      } catch (validationError) {
-        console.error(`[edit-agent] StabilityAI validation failed:`, validationError)
-        steps.push({ step: "validate", info: { error: "Validation failed", details: validationError instanceof Error ? validationError.message : String(validationError) } })
+        const stabilityPrompt: string = intent.isRemove
+          ? `Remove ${intent.target} completely and fill the area naturally with the surrounding background`
+          : instruction
+        const out = await stabilityInpaint(imageData, refinedMask, stabilityPrompt)
+        steps.push({ step: "stability_inpaint", image: out.processedImageData })
+        return NextResponse.json({ ok: true, result: out.processedImageData, steps })
+      } catch (stabilityError) {
+        console.error("Stability AI inpainting failed:", stabilityError);
+        return NextResponse.json({ error: `Stability AI API error: ${stabilityError instanceof Error ? stabilityError.message : String(stabilityError)}` }, { status: 502 });
       }
-      return NextResponse.json({ ok: true, result: out.processedImageData, steps })
     }
 
-    return NextResponse.json({ error: "Unsupported aiModel" }, { status: 400 })
-  } catch (e: any) {
-    console.error("[edit-agent] Error in POST handler:", e)
-    console.error("[edit-agent] Error stack:", e?.stack)
-    console.error("[edit-agent] Error type:", typeof e)
-    console.error("[edit-agent] Error constructor:", e?.constructor?.name)
-    
-    // Log additional error details
-    if (e instanceof Error) {
-      console.error("[edit-agent] Error name:", e.name)
-      console.error("[edit-agent] Error message:", e.message)
-    }
-    
-    return NextResponse.json({ 
-      error: e?.message || "Unknown error", 
-      details: e?.toString(),
-      stack: e?.stack,
-      type: typeof e,
-      constructor: e?.constructor?.name
-    }, { status: 500 })
+    return NextResponse.json({ error: "Unsupported AI model" }, { status: 501 });
+
+  } catch (error) {
+    console.error("[edit-agent] Unexpected error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }
