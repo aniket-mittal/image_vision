@@ -1430,6 +1430,44 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     out_np = clone
 
+                # Laplacian pyramid blending for multi-scale seam smoothing
+                try:
+                    def _gauss_pyr(img, levels=4):
+                        gp = [img.astype(np.float32)]
+                        for _ in range(levels):
+                            img = cv2.pyrDown(img)
+                            gp.append(img.astype(np.float32))
+                        return gp
+                    def _lap_pyr(img, levels=4):
+                        gp = _gauss_pyr(img, levels)
+                        lp = []
+                        for i in range(levels, 0, -1):
+                            size = (gp[i-1].shape[1], gp[i-1].shape[0])
+                            GE = cv2.pyrUp(gp[i], dstsize=size)
+                            L = gp[i-1] - GE
+                            lp.append(L)
+                        lp.append(gp[0])
+                        return lp
+                    def _reconstruct(lp):
+                        img = lp[-1]
+                        for i in range(len(lp)-2, -1, -1):
+                            size = (lp[i].shape[1], lp[i].shape[0])
+                            img = cv2.pyrUp(img, dstsize=size)
+                            img = img + lp[i]
+                        return img
+                    levels = int(payload.get("pyramid_levels", 4))
+                    m_soft = (mask_soft.astype(np.float32) / 255.0)
+                    m3 = np.dstack([m_soft]*3)
+                    lp_o = _lap_pyr(o.astype(np.float32), levels)
+                    lp_c = _lap_pyr(clone.astype(np.float32), levels)
+                    gp_m = _gauss_pyr(m3.astype(np.float32), levels)
+                    lp_blend = []
+                    for Lc, Lo, Gm in zip(lp_c, lp_o, gp_m):
+                        lp_blend.append(Lc * Gm + Lo * (1.0 - Gm))
+                    out_np = np.clip(_reconstruct(lp_blend), 0, 255).astype(np.uint8)
+                except Exception as _e_pyr:
+                    print("[ModelServer] pyramid blend failed:", _e_pyr)
+
                 # Match local color/contrast of edited region to surrounding ring
                 try:
                     ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
@@ -1447,6 +1485,15 @@ class Handler(BaseHTTPRequestHandler):
                             out_np[:, :, c] = np.clip(adj, 0, 255).astype(np.uint8)
                 except Exception as _e_color:
                     print("[ModelServer] color match failed:", _e_color)
+
+                # Inpaint narrow seam edge to remove residual halos
+                try:
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    edge = cv2.morphologyEx((mask_np > 127).astype(np.uint8), cv2.MORPH_GRADIENT, k)
+                    edge = cv2.dilate(edge, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+                    out_np = cv2.inpaint(out_np, (edge*255).astype(np.uint8), 3, cv2.INPAINT_TELEA)
+                except Exception as _e_inp:
+                    print("[ModelServer] seam inpaint failed:", _e_inp)
 
                 # Subtle grain to reduce plasticky look
                 if add_grain:
