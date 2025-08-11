@@ -1266,6 +1266,70 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(e)})
 
         # ---------- EDIT PIPELINE ENDPOINTS ----------
+        if endpoint == "validate_edit":
+            try:
+                import cv2
+                orig_data = payload.get("original_image_data")
+                edited_data = payload.get("edited_image_data")
+                concept = payload.get("concept", "object")
+                mask_png = payload.get("mask_png", "")
+                if not orig_data or not edited_data or not mask_png:
+                    return self._send(400, {"error": "original_image_data, edited_image_data, and mask_png are required"})
+                def _decode_img(data_url: str) -> Image.Image:
+                    if data_url.startswith("data:image"):
+                        _, b64 = data_url.split(",", 1)
+                    else:
+                        b64 = data_url
+                    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                pil_o = _decode_img(orig_data)
+                pil_e = _decode_img(edited_data)
+                if pil_o.size != pil_e.size:
+                    pil_e = pil_e.resize(pil_o.size, Image.BICUBIC)
+                W, H = pil_o.size
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mask = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((W, H))
+                mask_np = (np.array(mask) > 127).astype(np.uint8)
+                # Seam ring: 5-15px ring
+                ring_inner = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+                ring_outer = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+                ring = ((ring_outer - ring_inner) > 0).astype(np.uint8)
+                o = np.array(pil_o).astype(np.float32)
+                e = np.array(pil_e).astype(np.float32)
+                # Compute SSIM on ring per channel and average
+                if ring.sum() > 0 and SKIMAGE_AVAILABLE:
+                    svals = []
+                    for c in range(3):
+                        so = ssim(o[:, :, c] / 255.0, e[:, :, c] / 255.0, data_range=1.0)
+                        svals.append(float(so))
+                    seam_ssim = float(np.mean(svals))
+                elif ring.sum() > 0:
+                    # Fallback when skimage is not available - use simple pixel difference
+                    diff = np.abs(o - e) / 255.0
+                    seam_ssim = 1.0 - np.mean(diff[ring > 0])
+                    seam_ssim = max(0.0, min(1.0, seam_ssim))  # Clamp to [0, 1]
+                else:
+                    seam_ssim = 1.0
+
+                # Grounding check on edited image
+                try:
+                    tmp_dir = tempfile.gettempdir()
+                    p_edit = os.path.join(tmp_dir, f"val_edit_{int(time.time()*1000)}.jpg")
+                    pil_e.save(p_edit)
+                    _m, _b, _phr = DETECTOR.detect_and_segment(image=p_edit, text_prompt=concept)
+                    remaining = len(_b)
+                except Exception as _e:
+                    print("[ModelServer] validate_edit GroundingDINO failed:", _e)
+                    remaining = -1
+
+                passed = (seam_ssim > 0.85) and (remaining == 0 or remaining == -1)
+                return self._send(200, {"seam_ssim": seam_ssim, "remaining_objects": remaining, "passed": passed})
+            except Exception as e:
+                print("[ModelServer] validate_edit error:", e)
+                return self._send(500, {"error": str(e)})
+
         if endpoint == "mask_from_text":
             try:
                 image_path = ensure_image_path(payload)
@@ -1337,10 +1401,11 @@ class Handler(BaseHTTPRequestHandler):
                             # Convert PIL to numpy for FBA
                             img_np = np.array(pil)
                             
-                            # Create trimap from soft mask
-                            trimap = np.zeros((H, W, 2), dtype=np.float32)
+                            # Create trimap from soft mask - FBA expects 3-channel input
+                            trimap = np.zeros((H, W, 3), dtype=np.float32)
                             trimap[:, :, 0] = soft  # Foreground
                             trimap[:, :, 1] = 1.0 - soft  # Background
+                            trimap[:, :, 2] = 0.0  # Unknown (set to 0)
                             
                             # Scale to multiple of 8 (FBA requirement)
                             scale = 8
@@ -1350,7 +1415,7 @@ class Handler(BaseHTTPRequestHandler):
                             img_scaled = cv2.resize(img_np, (w_scaled, h_scaled))
                             trimap_scaled = cv2.resize(trimap, (w_scaled, h_scaled))
                             
-                            # Convert to torch tensors
+                            # Convert to torch tensors - FBA expects 3-channel input
                             img_tensor = torch.from_numpy(img_scaled).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                             trimap_tensor = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0).float()
                             
@@ -1851,70 +1916,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             print("[ModelServer] fallback inpainting error:", e)
             return self._send(500, {"error": f"Fallback inpainting failed: {e}"})
-
-        if endpoint == "validate_edit":
-            try:
-                import cv2
-                orig_data = payload.get("original_image_data")
-                edited_data = payload.get("edited_image_data")
-                concept = payload.get("concept", "object")
-                mask_png = payload.get("mask_png", "")
-                if not orig_data or not edited_data or not mask_png:
-                    return self._send(400, {"error": "original_image_data, edited_image_data, and mask_png are required"})
-                def _decode_img(data_url: str) -> Image.Image:
-                    if data_url.startswith("data:image"):
-                        _, b64 = data_url.split(",", 1)
-                    else:
-                        b64 = data_url
-                    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                pil_o = _decode_img(orig_data)
-                pil_e = _decode_img(edited_data)
-                if pil_o.size != pil_e.size:
-                    pil_e = pil_e.resize(pil_o.size, Image.BICUBIC)
-                W, H = pil_o.size
-                if mask_png.startswith("data:image"):
-                    _, m64 = mask_png.split(",", 1)
-                else:
-                    m64 = mask_png
-                mask = Image.open(BytesIO(base64.b64decode(m64))).convert("L").resize((W, H))
-                mask_np = (np.array(mask) > 127).astype(np.uint8)
-                # Seam ring: 5-15px ring
-                ring_inner = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-                ring_outer = cv2.dilate(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
-                ring = ((ring_outer - ring_inner) > 0).astype(np.uint8)
-                o = np.array(pil_o).astype(np.float32)
-                e = np.array(pil_e).astype(np.float32)
-                # Compute SSIM on ring per channel and average
-                if ring.sum() > 0 and SKIMAGE_AVAILABLE:
-                    svals = []
-                    for c in range(3):
-                        so = ssim(o[:, :, c] / 255.0, e[:, :, c] / 255.0, data_range=1.0)
-                        svals.append(float(so))
-                    seam_ssim = float(np.mean(svals))
-                elif ring.sum() > 0:
-                    # Fallback when skimage is not available - use simple pixel difference
-                    diff = np.abs(o - e) / 255.0
-                    seam_ssim = 1.0 - np.mean(diff[ring > 0])
-                    seam_ssim = max(0.0, min(1.0, seam_ssim))  # Clamp to [0, 1]
-                else:
-                    seam_ssim = 1.0
-
-                # Grounding check on edited image
-                try:
-                    tmp_dir = tempfile.gettempdir()
-                    p_edit = os.path.join(tmp_dir, f"val_edit_{int(time.time()*1000)}.jpg")
-                    pil_e.save(p_edit)
-                    _m, _b, _phr = DETECTOR.detect_and_segment(image=p_edit, text_prompt=concept)
-                    remaining = len(_b)
-                except Exception as _e:
-                    print("[ModelServer] validate_edit GroundingDINO failed:", _e)
-                    remaining = -1
-
-                passed = (seam_ssim > 0.85) and (remaining == 0 or remaining == -1)
-                return self._send(200, {"seam_ssim": seam_ssim, "remaining_objects": remaining, "passed": passed})
-            except Exception as e:
-                print("[ModelServer] validate_edit error:", e)
-                return self._send(500, {"error": str(e)})
 
         return self._send(404, {"error": "not found"})
 
