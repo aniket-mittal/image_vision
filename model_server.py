@@ -1385,12 +1385,12 @@ class Handler(BaseHTTPRequestHandler):
                     mask_np = 255 - mask_np
 
                 # Feather for soft boundaries in later alpha blend
-                if feather_px > 0:
-                    try:
-                        mask_soft = cv2.GaussianBlur(mask_np, (0, 0), max(1.0, float(feather_px)))
-                    except Exception:
-                        mask_soft = mask_np
-                else:
+                # Aggressive multi-scale feather for seamless boundary
+                try:
+                    sigma = max(2.0, float(feather_px))
+                    mask_soft = cv2.GaussianBlur(mask_np, (0, 0), sigma)
+                    mask_soft = cv2.GaussianBlur(mask_soft, (0, 0), sigma * 0.5)
+                except Exception:
                     mask_soft = mask_np
 
                 o = np.array(pil_o)
@@ -1420,8 +1420,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Match local color/contrast of edited region to surrounding ring
                 try:
-                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
-                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
+                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61)))
                     ring = ((ring_out - ring_in) > 0)
                     for c in range(3):
                         region = out_np[:, :, c][mask_np > 127]
@@ -1447,7 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                             noise_level = float(np.std(samp) / 255.0)
                         except Exception:
                             pass
-                        gstd = max(0.0, min(0.15, noise_level * 0.5 + grain_strength))
+                        gstd = max(0.0, min(0.2, noise_level * 0.6 + grain_strength))
                         noise = np.random.normal(0.0, gstd * 255.0, size=out_np.shape).astype(np.float32)
                         out_np = np.clip(out_np.astype(np.float32) + noise * ((mask_np > 127)[..., None].astype(np.float32)), 0, 255).astype(np.uint8)
                     except Exception as _e_grain:
@@ -1513,12 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
                         mm = mm[0]
                     mm = np.clip(mm, 0.0, 1.0)
                     mean_val = float(mm.mean())
-                    # Heuristic: if majority is selected (>0.5 avg), invert assuming background=1
-                    if mean_val > 0.5:
-                        mm = 1.0 - mm
-                        print(f"[ModelServer] mask_from_text: Inverted mask {idx} due to high mean={mean_val:.3f}")
-                    else:
-                        print(f"[ModelServer] mask_from_text: Kept mask {idx} mean={mean_val:.3f}")
+                    print(f"[ModelServer] mask_from_text: raw mask {idx} mean={mean_val:.3f}")
                     return mm
                 
                 combined = np.zeros((H, W), dtype=np.float32)
@@ -1528,6 +1523,32 @@ class Handler(BaseHTTPRequestHandler):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
                 
+                # Use detector boxes to disambiguate orientation if needed
+                try:
+                    if boxes:
+                        boxes_mask = np.zeros((H, W), dtype=np.uint8)
+                        for b in boxes:
+                            # GroundingDINO returns (cx, cy, w, h) normalized
+                            cx, cy, bw, bh = b
+                            x1 = max(0, int((cx - bw / 2) * W))
+                            y1 = max(0, int((cy - bh / 2) * H))
+                            x2 = min(W - 1, int((cx + bw / 2) * W))
+                            y2 = min(H - 1, int((cy + bh / 2) * H))
+                            if x2 < x1: x1, x2 = x2, x1
+                            if y2 < y1: y1, y2 = y2, y1
+                            boxes_mask[y1:y2+1, x1:x2+1] = 1
+                        inside_soft = float((combined * boxes_mask).sum())
+                        inside_inv = float(((1.0 - combined) * boxes_mask).sum())
+                        if inside_inv > inside_soft:
+                            combined = 1.0 - combined
+                            print(f"[ModelServer] mask_from_text: Orientation flipped based on boxes (inside_inv {inside_inv:.1f} > inside_soft {inside_soft:.1f})")
+                        else:
+                            print(f"[ModelServer] mask_from_text: Orientation kept (inside_soft {inside_soft:.1f} >= inside_inv {inside_inv:.1f})")
+                    else:
+                        print("[ModelServer] mask_from_text: No boxes provided; keeping raw orientation")
+                except Exception as _e_orient:
+                    print("[ModelServer] orientation disambiguation failed:", _e_orient)
+
                 c_min, c_max, c_mean = float(combined.min()), float(combined.max()), float(combined.mean())
                 print(f"[ModelServer] mask_from_text: combined stats min={c_min:.3f} max={c_max:.3f} mean={c_mean:.3f}")
 
