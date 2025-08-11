@@ -1426,28 +1426,57 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         print("[ModelServer] mask_from_text: Attempting FBA refinement...")
                         net = ensure_fba_loaded()
-                        if net is not None:
-                            img_np = np.array(pil)
-                            trimap = np.zeros((H, W, 3), dtype=np.float32)
-                            trimap[:, :, 0] = soft
-                            trimap[:, :, 1] = 1.0 - soft
-                            trimap[:, :, 2] = 0.0
-                            import cv2 as _cv
-                            scale = 8
-                            h_scaled = ((H + scale - 1) // scale) * scale
-                            w_scaled = ((W + scale - 1) // scale) * scale
-                            img_scaled = _cv.resize(img_np, (w_scaled, h_scaled))
-                            trimap_scaled = _cv.resize(trimap, (w_scaled, h_scaled))
-                            img_tensor = torch.from_numpy(img_scaled).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-                            trimap_tensor = torch.from_numpy(trimap_scaled).permute(2, 0, 1).unsqueeze(0).float()
+                        if net is not None and not isinstance(net, str):
+                            # Use the exact pipeline from matting_refine
+                            fg = (soft > 0.9).astype(np.uint8)
+                            bg = (soft < 0.1).astype(np.uint8)
+                            trimap_2ch = np.stack([bg, fg], axis=-1).astype(np.float32)
+
+                            # Scale inputs to multiple of 8
+                            def scale_input(x, scale=1.0):
+                                h, w = x.shape[:2]
+                                h1 = int(np.ceil(scale * h / 8) * 8)
+                                w1 = int(np.ceil(scale * w / 8) * 8)
+                                import cv2 as _cv
+                                return _cv.resize(x, (w1, h1), interpolation=_cv.INTER_LANCZOS4)
+
+                            image_scaled = scale_input(np.array(pil).astype(np.float32) / 255.0)
+                            trimap_scaled = scale_input(trimap_2ch.astype(np.float32))
+
+                            from networks.transforms import trimap_transform, normalise_image
+
                             device = next(net.parameters()).device
-                            img_tensor = img_tensor.to(device)
-                            trimap_tensor = trimap_tensor.to(device)
+                            model_dtype = next(net.parameters()).dtype
+
+                            def np_to_torch(x: np.ndarray, permute: bool) -> torch.Tensor:
+                                t = torch.from_numpy(x)
+                                if permute:
+                                    t = t.permute(2, 0, 1)
+                                return t.unsqueeze(0).to(device=device, dtype=model_dtype)
+
+                            img_t = np_to_torch(image_scaled, permute=True)
+                            trimap_t = np_to_torch(trimap_scaled, permute=True)
+
+                            trimap_transformed_torch = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device=device, dtype=model_dtype)
+                            image_transformed_torch = normalise_image(img_t.clone()).to(device=device, dtype=model_dtype)
+
+                            try:
+                                net = net.to(device)
+                            except Exception:
+                                pass
+
                             with torch.no_grad():
-                                refined_alpha = net(img_tensor, trimap_tensor, img_tensor, trimap_tensor)
-                            refined_alpha = refined_alpha.squeeze(0).squeeze(0).detach().cpu().numpy()
-                            soft = np.clip(refined_alpha, 0.0, 1.0)
+                                output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
+
+                            if isinstance(output, (list, tuple)):
+                                output = output[0]
+                            alpha_scaled = output[0, 0].detach().cpu().numpy()
+                            import cv2 as _cv
+                            alpha = _cv.resize(alpha_scaled, (W, H), interpolation=_cv.INTER_LANCZOS4)
+                            soft = np.clip(alpha, 0.0, 1.0)
                             print("[ModelServer] mask_from_text: FBA refinement applied")
+                        else:
+                            print("[ModelServer] mask_from_text: FBA unavailable, skipping")
                     except Exception as e:
                         print("[ModelServer] mask_from_text: FBA refinement failed:", e)
 
