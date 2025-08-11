@@ -502,10 +502,10 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .toBuffer();
       // Build a multi-scale feathered alpha to reduce seams
       let editAlpha = await sharp(baseAlpha).linear(-1, 255).toBuffer()
-      // Heavier multi-scale blur + lower threshold to slightly expand the edit region (~10% more)
-      editAlpha = await sharp(editAlpha).blur(2.5).toBuffer()
-      editAlpha = await sharp(editAlpha).blur(1.2).toBuffer()
-      editAlpha = await sharp(editAlpha).threshold(56).toBuffer()
+      // Heavier multi-scale blur + lower threshold to expand the edit region (~another 10%)
+      editAlpha = await sharp(editAlpha).blur(3.0).toBuffer()
+      editAlpha = await sharp(editAlpha).blur(1.4).toBuffer()
+      editAlpha = await sharp(editAlpha).threshold(48).toBuffer()
 
       const genRGBA = await sharp(genResized)
         .joinChannel(editAlpha)
