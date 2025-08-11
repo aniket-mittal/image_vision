@@ -1339,6 +1339,127 @@ class Handler(BaseHTTPRequestHandler):
                 print("[ModelServer] validate_edit error:", e)
                 return self._send(500, {"error": str(e)})
 
+        if endpoint == "seamless_blend":
+            # Post-process an already edited image to reduce seams and improve realism
+            try:
+                import cv2
+                orig_data = payload.get("original_image_data")
+                edited_data = payload.get("edited_image_data")
+                mask_png = payload.get("mask_png", "")
+                feather_px = int(payload.get("feather_px", 8))
+                add_grain = bool(payload.get("add_grain", True))
+                grain_strength = float(payload.get("grain_strength", 0.08))
+                if not orig_data or not edited_data or not mask_png:
+                    return self._send(400, {"error": "original_image_data, edited_image_data, and mask_png are required"})
+
+                def _decode_img(data_url: str) -> Image.Image:
+                    if data_url.startswith("data:image"):
+                        _, b64 = data_url.split(",", 1)
+                    else:
+                        b64 = data_url
+                    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+
+                pil_o = _decode_img(orig_data)
+                pil_e = _decode_img(edited_data)
+                if pil_o.size != pil_e.size:
+                    pil_e = pil_e.resize(pil_o.size, Image.LANCZOS)
+                W, H = pil_o.size
+                if mask_png.startswith("data:image"):
+                    _, m64 = mask_png.split(",", 1)
+                else:
+                    m64 = mask_png
+                mimg = Image.open(BytesIO(base64.b64decode(m64)))
+                # Prefer alpha channel if present; else luminance
+                try:
+                    if mimg.mode in ("RGBA", "LA") and mimg.getbands()[-1] == "A":
+                        mask_gray = mimg.split()[-1]
+                    else:
+                        mask_gray = mimg.convert("L")
+                except Exception:
+                    mask_gray = mimg.convert("L")
+                mask_gray = mask_gray.resize((W, H))
+                mask_np = np.array(mask_gray).astype(np.uint8)
+                # Ensure 255 inside edit region (white means edit)
+                # If mask looks like alpha (0 in edit), invert
+                if mask_np.mean() < 127:
+                    mask_np = 255 - mask_np
+
+                # Feather for soft boundaries in later alpha blend
+                if feather_px > 0:
+                    try:
+                        mask_soft = cv2.GaussianBlur(mask_np, (0, 0), max(1.0, float(feather_px)))
+                    except Exception:
+                        mask_soft = mask_np
+                else:
+                    mask_soft = mask_np
+
+                o = np.array(pil_o)
+                e = np.array(pil_e)
+
+                # Poisson seamless clone for realistic boundary blending
+                try:
+                    ys, xs = np.where(mask_np > 127)
+                    if ys.size and xs.size:
+                        cx = int((xs.min() + xs.max()) / 2)
+                        cy = int((ys.min() + ys.max()) / 2)
+                        center = (cx, cy)
+                    else:
+                        center = (W // 2, H // 2)
+                    clone = cv2.seamlessClone(e, o, mask_np, center, cv2.NORMAL_CLONE)
+                except Exception as _e_sc:
+                    print("[ModelServer] seamlessClone failed, will alpha blend:", _e_sc)
+                    clone = e
+
+                # Alpha blend with soft mask to further smooth transitions
+                try:
+                    alpha = (mask_soft.astype(np.float32) / 255.0)[..., None]
+                    blended = clone.astype(np.float32) * alpha + o.astype(np.float32) * (1.0 - alpha)
+                    out_np = np.clip(blended, 0, 255).astype(np.uint8)
+                except Exception:
+                    out_np = clone
+
+                # Match local color/contrast of edited region to surrounding ring
+                try:
+                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
+                    ring = ((ring_out - ring_in) > 0)
+                    for c in range(3):
+                        region = out_np[:, :, c][mask_np > 127]
+                        back = o[:, :, c][ring]
+                        if region.size and back.size:
+                            mu_r, std_r = float(region.mean()), float(region.std() + 1e-6)
+                            mu_b, std_b = float(back.mean()), float(back.std() + 1e-6)
+                            gain = std_b / std_r
+                            bias = mu_b - gain * mu_r
+                            adj = gain * out_np[:, :, c].astype(np.float32) + bias
+                            out_np[:, :, c] = np.clip(adj, 0, 255).astype(np.uint8)
+                except Exception as _e_color:
+                    print("[ModelServer] color match failed:", _e_color)
+
+                # Subtle grain to reduce plasticky look
+                if add_grain:
+                    try:
+                        # Estimate noise in background ring, use a fraction
+                        ring_mask = ring if 'ring' in locals() else (mask_np == 0)
+                        noise_level = 0.0
+                        try:
+                            samp = o[:, :, 0][ring_mask]
+                            noise_level = float(np.std(samp) / 255.0)
+                        except Exception:
+                            pass
+                        gstd = max(0.0, min(0.15, noise_level * 0.5 + grain_strength))
+                        noise = np.random.normal(0.0, gstd * 255.0, size=out_np.shape).astype(np.float32)
+                        out_np = np.clip(out_np.astype(np.float32) + noise * ((mask_np > 127)[..., None].astype(np.float32)), 0, 255).astype(np.uint8)
+                    except Exception as _e_grain:
+                        print("[ModelServer] grain add failed:", _e_grain)
+
+                out_pil = Image.fromarray(out_np)
+                b64 = np_to_jpeg_base64(out_pil)
+                return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
+            except Exception as e:
+                print("[ModelServer] seamless_blend error:", e)
+                return self._send(500, {"error": str(e)})
+
         if endpoint == "mask_from_text":
             try:
                 image_path = ensure_image_path(payload)

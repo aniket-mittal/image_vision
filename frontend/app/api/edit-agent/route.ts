@@ -146,22 +146,12 @@ async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, heigh
     finalAlpha = await sharp(gray).linear(-1, 255).toBuffer()
   }
 
-  // Debug: compute coverage using resolved info (respect channels)
+  // Debug: compute coverage on final alpha
   try {
-    const { data, info } = await sharp(editFeathered).raw().toBuffer({ resolveWithObject: true }) as any
+    const { data, info } = await sharp(finalAlpha).raw().toBuffer({ resolveWithObject: true }) as any
     let countWhite = 0
-    const channels = info.channels || 1
-    if (channels === 1) {
-      for (let i = 0; i < data.length; i++) if (data[i] === 255) countWhite++
-    } else {
-      for (let i = 0; i < data.length; i += channels) {
-        // Treat pixel as white if any channel is 255
-        let isWhite = false
-        for (let c = 0; c < channels; c++) if (data[i + c] === 255) { isWhite = true; break }
-        if (isWhite) countWhite++
-      }
-    }
-    console.log(`[edit-agent] buildTransparentMaskPng: edit white pixels=${countWhite} of ${w*h} (channels=${channels})`)
+    for (let i = 0; i < data.length; i++) if (data[i] === 0) countWhite++ // finalAlpha is 0 in edit region
+    console.log(`[edit-agent] buildTransparentMaskPng: edit pixels (alpha==0)=${countWhite} of ${w*h}`)
   } catch {}
 
   const rgba = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 0, g: 0, b: 0 } } })
@@ -327,25 +317,33 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
 
     // Always standardize the mask to "transparent where to edit"
     // This avoids pass-through of opaque RGBA masks (e.g., from matting_refine)
+    // IMPORTANT: Use server-provided debug binary mask (white=edit), convert to transparent-hole
     let transparentMask: Buffer
-    let coverage = 0
     try {
-      const s = await standardizeMaskAndGetCoverage(maskPng, targetW, targetH)
-      transparentMask = s.standardized
-      coverage = s.white
-      console.log(`[edit-agent] Standardized mask coverage (pixels white/edit)=${coverage} of ${targetW*targetH}`)
-    } catch (e) {
-      console.warn('[edit-agent] Failed to standardize mask; attempting raw alpha path:', e)
-      try {
-        transparentMask = await sharp(sourceMaskBuf)
-          .ensureAlpha()
-          .resize(targetW, targetH, { fit: 'fill' })
-          .png()
-          .toBuffer()
-      } catch (e2) {
-        console.warn('[edit-agent] Raw alpha path failed; rebuilding by grayscale:', e2)
-        transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
+      // Use binary debug if available first
+      const serverDebugBinary = maskPng
+      // If it's a data URL string, convert to Buffer first
+      const maybeBuf = serverDebugBinary.startsWith('data:image')
+        ? Buffer.from(serverDebugBinary.split(',')[1], 'base64')
+        : Buffer.from(serverDebugBinary, 'base64')
+      const dbgMeta = await sharp(maybeBuf).metadata().catch(() => null)
+      let dbgBuf: Buffer
+      if (dbgMeta) {
+        dbgBuf = maybeBuf
+      } else {
+        dbgBuf = sourceMaskBuf
       }
+      // Convert binary white=edit to alpha hole
+      const binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
+      const alphaHole = await sharp(binaryResized).linear(-1, 255).toBuffer() // alpha=255 outside, 0 inside
+      transparentMask = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+        .joinChannel(alphaHole)
+        .png()
+        .toBuffer()
+      console.log('[edit-agent] Built transparent-hole mask from server debug binary')
+    } catch (e) {
+      console.warn('[edit-agent] Failed to build from debug binary; falling back to standardize path:', e)
+      transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
     }
 
     // For statistics, analyze the binary edit mask used to create alpha (white=edit)
@@ -362,21 +360,6 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       return { white, black }
     }
     let { white: whitePixels, black: blackPixels } = await computeMaskStats(transparentMask)
-    if (whitePixels === 0 && coverage > 0) {
-      // If coverage computed earlier indicates white>0, but alpha analysis shows 0, the alpha channel might be inverted.
-      console.warn('[edit-agent] Alpha analysis shows zero white but coverage earlier was >0; inverting alpha as fallback')
-      const invAlphaForStats = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
-      const invRGBA = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
-        .joinChannel(invAlphaForStats)
-        .png()
-        .toBuffer()
-      const stats2 = await computeMaskStats(invRGBA)
-      if (stats2.white > 0) {
-        transparentMask = invRGBA
-        whitePixels = stats2.white
-        blackPixels = stats2.black
-      }
-    }
     console.log(`Mask dimensions: ${targetW}x${targetH}`)
     console.log(`Mask pixel analysis: White(edit): ${whitePixels}, Black(keep): ${blackPixels}`)
 
@@ -510,16 +493,19 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
 
-      // Resize mask alpha to original aspect ratio dimensions
-      const maskAlpha = await sharp(transparentMask)
+      // Build overlay alpha that is 255 INSIDE edit region (so generated content only paints inside hole)
+      const baseAlpha = await sharp(transparentMask)
         .ensureAlpha()
         .extractChannel('alpha')
         .resize(targetWidth, targetHeight, { fit: 'fill' })
+        .toBuffer();
+      const editAlpha = await sharp(baseAlpha)
+        .linear(-1, 255) // invert: alpha 255 inside edit region
         .threshold(128)
         .toBuffer();
 
       const genRGBA = await sharp(genResized)
-        .joinChannel(maskAlpha)
+        .joinChannel(editAlpha)
         .png()
         .toBuffer();
 
@@ -533,7 +519,7 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .toBuffer();
 
       processedImageData = `data:image/png;base64,${finalComposite.toString('base64')}`;
-      console.log(`Composited generated content into masked region at ${targetWidth}x${targetHeight}`);
+      console.log(`Composited generated content into EDIT region at ${targetWidth}x${targetHeight}`);
     }
 
     // Save result for debugging
@@ -876,35 +862,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: `Mask generation failed: ${errorMessage}` }, { status: 502 })
     }
     
-    // Try matting refine to improve edges
-    let refinedMask = mask.mask_png
-    try {
-      console.log("[edit-agent] Attempting matting refine...")
-      const r = await callMattingRefine(imageData, mask.mask_png)
-      if (r?.refined_mask_png) {
-        refinedMask = r.refined_mask_png
-        console.log("[edit-agent] Matting refine successful, using refined mask")
-        steps.push({ step: "matting_refine", image: refinedMask })
-        try { await saveTempDataUrl(refinedMask, 'refined_mask.png') } catch {}
-      } else {
-        console.log("[edit-agent] Matting refine returned no refined mask, using original")
-      }
-    } catch (mattingError) {
-      console.log("[edit-agent] Matting refine failed, using original mask:", mattingError instanceof Error ? mattingError.message : String(mattingError))
-    }
-
-    // Save the final mask being used for editing
-    try {
-      await saveTempDataUrl(refinedMask, 'final_edit_mask.png')
-    } catch (e) {
-      console.warn('Failed saving final edit mask:', e)
-    }
+    // Build canonical OpenAI mask from server debug binary if available
+    const openAIMask = mask?.debug_binary_mask_png || mask?.mask_png
+    steps.push({ step: "mask_openai_source", image: openAIMask })
+    try { await saveTempDataUrl(openAIMask, 'final_edit_mask.png') } catch {}
 
     // Routing and execution
     let edited: { processedImageData: string } | null = null
     if (previewOnly) {
       // Preview: use lightweight fallback inpainting on server
-      const editedFb = await callModelServer("inpaint_fallback", { image_data: imageData, mask_png: refinedMask }) as { processedImageData: string }
+      const editedFb = await callModelServer("inpaint_fallback", { image_data: imageData, mask_png: openAIMask }) as { processedImageData: string }
       steps.push({ step: "inpaint_preview", image: editedFb.processedImageData })
       
       // Try validation but don't fail if it doesn't work
@@ -912,7 +879,7 @@ export async function POST(req: NextRequest) {
       const val = await callModelServer("validate_edit", {
         original_image_data: imageData,
         edited_image_data: editedFb.processedImageData,
-        mask_png: refinedMask,
+        mask_png: openAIMask,
         concept: intent.target || "object",
       })
       steps.push({ step: "validate", info: val })
@@ -939,13 +906,13 @@ export async function POST(req: NextRequest) {
       let attempt = 0
       let best = null as any
       while (attempt < 2) {
-        const out = await inpaintSDXL(imageData, refinedMask, prompt, params)
+        const out = await inpaintSDXL(imageData, openAIMask, prompt, params)
         let val = null
         try {
           val = await callModelServer("validate_edit", {
             original_image_data: imageData,
             edited_image_data: out.processedImageData,
-            mask_png: refinedMask,
+            mask_png: openAIMask,
             concept: intent.target || "object",
           })
         } catch (validationError) {
@@ -980,14 +947,14 @@ export async function POST(req: NextRequest) {
       console.log(`[edit-agent] Starting OpenAI image edit...`)
       
       try {
-        const out = await openAIImagesEdit(imageData, refinedMask, prompt)
+        const out = await openAIImagesEdit(imageData, openAIMask, prompt)
         steps.push({ step: "openai_images_edit", image: out.processedImageData })
         // Optionally run validation without failing the request
         try {
           const val = await callModelServer("validate_edit", {
             original_image_data: imageData,
             edited_image_data: out.processedImageData,
-            mask_png: refinedMask,
+            mask_png: openAIMask,
             concept: intent.target || "object",
           })
           steps.push({ step: "validate", info: val })
@@ -1006,7 +973,7 @@ export async function POST(req: NextRequest) {
         const stabilityPrompt: string = intent.isRemove
           ? `Remove ${intent.target} completely and fill the area naturally with the surrounding background`
           : instruction
-        const out = await stabilityInpaint(imageData, refinedMask, stabilityPrompt)
+        const out = await stabilityInpaint(imageData, openAIMask, stabilityPrompt)
         steps.push({ step: "stability_inpaint", image: out.processedImageData })
         return NextResponse.json({ ok: true, result: out.processedImageData, steps })
       } catch (stabilityError) {
