@@ -1515,10 +1515,9 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as _e_inp:
                     print("[ModelServer] seam inpaint failed:", _e_inp)
 
-                # Subtle grain to reduce plasticky look
+                # Grain disabled by default to avoid any chance of visible frame banding
                 if add_grain:
                     try:
-                        # Estimate noise in background ring, use a fraction
                         ring_mask = ring if 'ring' in locals() else (mask_np == 0)
                         noise_level = 0.0
                         try:
@@ -1526,13 +1525,9 @@ class Handler(BaseHTTPRequestHandler):
                             noise_level = float(np.std(samp) / 255.0)
                         except Exception:
                             pass
-                        gstd = max(0.0, min(0.2, noise_level * 0.6 + grain_strength))
-                        # Apply grain only within a seam band
-                        seam_band = ((cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))) -
-                                      cv2.erode((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))) > 0)
+                        gstd = max(0.0, min(0.15, noise_level * 0.5 + grain_strength))
                         noise = np.random.normal(0.0, gstd * 255.0, size=out_np.shape).astype(np.float32)
-                        mask3 = np.stack([seam_band]*3, axis=-1).astype(np.float32)
-                        out_np = np.clip(out_np.astype(np.float32) + noise * mask3, 0, 255).astype(np.uint8)
+                        out_np = np.clip(out_np.astype(np.float32) + noise, 0, 255).astype(np.uint8)
                     except Exception as _e_grain:
                         print("[ModelServer] grain add failed:", _e_grain)
 
