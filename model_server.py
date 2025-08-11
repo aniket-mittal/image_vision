@@ -1123,8 +1123,8 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                             # Call FBA with correct 4 arguments
-                            with torch.no_grad():
-                                output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
+                        with torch.no_grad():
+                                 output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
                                 # Extract alpha channel and resize back to original size
                                 if isinstance(output, (list, tuple)):
                                     output = output[0]
@@ -1132,11 +1132,10 @@ class Handler(BaseHTTPRequestHandler):
                                 alpha_scaled = output[0, 0].cpu().numpy()
                                 # Resize back to original dimensions
                                 alpha = cv2.resize(alpha_scaled, (W, H), interpolation=cv2.INTER_LANCZOS4)
-                                refined = np.clip(alpha, 0.0, 1.0)
-                            print("[ModelServer] FBA refine successful using correct 4-argument API")
-                        except Exception as _e:
-                            print("[ModelServer] FBA refine failed, will fallback:", _e)
-                            refined = None
+                            refined = np.clip(alpha, 0.0, 1.0)
+                    except Exception as _e:
+                        print("[ModelServer] FBA refine failed, will fallback:", _e)
+                        refined = None
                 if refined is None:
                     # Fallback: edge-aware feather using distance transform
                     import cv2
@@ -1294,8 +1293,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 image_path = ensure_image_path(payload)
                 prompt = payload.get("prompt", "object")
-                dilate_px = int(payload.get("dilate_px", 3))
-                feather_px = int(payload.get("feather_px", 3))
+                # Allow server-side auto tuning when not provided
+                dilate_px = payload.get("dilate_px", None)
+                feather_px = payload.get("feather_px", None)
                 return_rgba = bool(payload.get("return_rgba", True))
                 if not image_path or not os.path.exists(image_path):
                     return self._send(400, {"error": "invalid image_path"})
@@ -1305,6 +1305,24 @@ class Handler(BaseHTTPRequestHandler):
                 masks, boxes, phrases = [], [], []
                 try:
                     _masks, _boxes, _phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
+                    # Filter masks by phrases that overlap with prompt tokens
+                    if _phrases:
+                        pnorm = prompt.lower()
+                        sel = []
+                        for i, phr in enumerate(_phrases):
+                            if isinstance(phr, str) and any(tok.strip() and tok.strip() in pnorm for tok in phr.lower().split()):
+                                sel.append(i)
+                        if not sel:
+                            # fallback to the largest mask if no phrase match
+                            try:
+                                areas = [float((_masks[i] > 0.5).sum()) for i in range(len(_masks))]
+                                sel = [int(np.argmax(areas))]
+                            except Exception:
+                                sel = list(range(len(_masks)))
+                        masks = [_masks[i] for i in sel]
+                        boxes = [_boxes[i] for i in sel] if _boxes else []
+                        phrases = [_phrases[i] for i in sel]
+                    else:
                     masks, boxes, phrases = _masks, _boxes, _phrases
                 except Exception as e:
                     print("[ModelServer] mask_from_text detection error:", e)
@@ -1323,8 +1341,34 @@ class Handler(BaseHTTPRequestHandler):
                     if m.shape != (H, W):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
-                # Mask hygiene: dilate then feather
+                # Compute area and auto-tune morphology if not specified
                 bin_mask = (combined > 0.5).astype(np.uint8) * 255
+                nonzero = np.count_nonzero(bin_mask)
+                area_ratio = nonzero / float(H * W)
+                if dilate_px is None or feather_px is None:
+                    if area_ratio < 0.02:
+                        auto_dilate, auto_feather = 6, 6
+                    elif area_ratio < 0.08:
+                        auto_dilate, auto_feather = 4, 4
+                    elif area_ratio < 0.2:
+                        auto_dilate, auto_feather = 3, 3
+                    else:
+                        auto_dilate, auto_feather = 2, 2
+                    dilate_px = int(dilate_px) if dilate_px is not None else auto_dilate
+                    feather_px = int(feather_px) if feather_px is not None else auto_feather
+                # Constrain mask to expanded bbox to prevent background drift
+                ys, xs = np.where(bin_mask > 0)
+                if ys.size and xs.size:
+                    y1, y2 = ys.min(), ys.max()
+                    x1, x2 = xs.min(), xs.max()
+                    margin_y = int(max(5, 0.05 * (y2 - y1)))
+                    margin_x = int(max(5, 0.05 * (x2 - x1)))
+                    y1 = max(0, y1 - margin_y); y2 = min(H - 1, y2 + margin_y)
+                    x1 = max(0, x1 - margin_x); x2 = min(W - 1, x2 + margin_x)
+                    constrained = np.zeros_like(bin_mask)
+                    constrained[y1:y2+1, x1:x2+1] = bin_mask[y1:y2+1, x1:x2+1]
+                    bin_mask = constrained
+                # Mask hygiene: dilate then feather
                 if dilate_px > 0:
                     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*dilate_px+1), max(1, 2*dilate_px+1)))
                     bin_mask = cv2.dilate(bin_mask, k, iterations=1)
@@ -1346,6 +1390,7 @@ class Handler(BaseHTTPRequestHandler):
                     "mask_png": f"data:image/png;base64,{mask_png_b64}",
                     "mask_binary_shape": [H, W],
                     "mask_binary_sum": int((soft>0.5).sum()),
+                    "mask_area_ratio": float(area_ratio),
                 })
             except Exception as e:
                 print("[ModelServer] mask_from_text error:", e)
