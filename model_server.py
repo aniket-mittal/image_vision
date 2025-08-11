@@ -1409,10 +1409,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         k = feather_px
                     mask_soft_f = 1.0 / (1.0 + np.exp(-signed / max(1.0, float(k))))
-                    # Build an alpha that is 1 in the core (far from edge), and soft only in a narrow seam band
-                    core = (signed > float(k)).astype(np.uint8)
-                    alpha_f = np.where(core > 0, 1.0, np.clip(mask_soft_f, 0.0, 1.0))
-                    mask_soft = (alpha_f * 255.0).astype(np.uint8)
+                    mask_soft = (mask_soft_f * 255.0).astype(np.uint8)
                 except Exception:
                     sigma = max(2.0, float(feather_px))
                     mask_soft = cv2.GaussianBlur(mask_np, (0, 0), sigma)
