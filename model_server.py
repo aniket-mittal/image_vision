@@ -1346,7 +1346,7 @@ class Handler(BaseHTTPRequestHandler):
                 orig_data = payload.get("original_image_data")
                 edited_data = payload.get("edited_image_data")
                 mask_png = payload.get("mask_png", "")
-                feather_px = int(payload.get("feather_px", 28))
+                feather_px = int(payload.get("feather_px", 16))
                 add_grain = bool(payload.get("add_grain", True))
                 grain_strength = float(payload.get("grain_strength", 0.1))
                 if not orig_data or not edited_data or not mask_png:
@@ -1384,9 +1384,9 @@ class Handler(BaseHTTPRequestHandler):
                 if mask_np.mean() < 127:
                     mask_np = 255 - mask_np
 
-                # Expand edit region to cover potential mask under-detection
+                # Optional: expand mask slightly to cover under-detection on thin extremities
                 try:
-                    expand = int(payload.get("expand_px", 28))
+                    expand = int(payload.get("expand_px", 12))
                     if expand > 0:
                         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*expand+1, 2*expand+1))
                         mask_np = cv2.dilate(mask_np, k, iterations=1)
@@ -1405,7 +1405,7 @@ class Handler(BaseHTTPRequestHandler):
                     if ys.size and xs.size:
                         obj_w = max(1, int(xs.max() - xs.min()))
                         obj_h = max(1, int(ys.max() - ys.min()))
-                        k = max(feather_px, int(0.035 * max(obj_w, obj_h)))
+                        k = max(feather_px, int(0.02 * max(obj_w, obj_h)))
                     else:
                         k = feather_px
                     mask_soft_f = 1.0 / (1.0 + np.exp(-signed / max(1.0, float(k))))
@@ -1465,7 +1465,7 @@ class Handler(BaseHTTPRequestHandler):
                             img = cv2.pyrUp(img, dstsize=size)
                             img = img + lp[i]
                         return img
-                    levels = int(payload.get("pyramid_levels", 5))
+                    levels = int(payload.get("pyramid_levels", 4))
                     m_soft = (mask_soft.astype(np.float32) / 255.0)
                     m3 = np.dstack([m_soft]*3)
                     lp_o = _lap_pyr(o.astype(np.float32), levels)
@@ -1480,8 +1480,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Match local color/contrast of edited region to surrounding ring
                 try:
-                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55)))
-                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (105, 105)))
+                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
                     ring = ((ring_out - ring_in) > 0)
                     for c in range(3):
                         region = out_np[:, :, c][mask_np > 127]

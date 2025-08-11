@@ -333,21 +333,8 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       } else {
         dbgBuf = sourceMaskBuf
       }
-      // Convert binary white=edit to alpha hole with dynamic expansion to cover seams
-      let binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
-      try {
-        // Dynamically expand edit region ~2% of max dimension (clamped)
-        const expandPx = Math.max(8, Math.min(64, Math.round(Math.max(targetW, targetH) * 0.02)))
-        const k = 2 * expandPx + 1
-        const kernel = Array(k * k).fill(1)
-        // Convolve (max-like) then threshold to achieve dilation
-        const dilated = await sharp(binaryResized)
-          .convolve({ width: k, height: k, kernel })
-          .threshold(1)
-          .toBuffer()
-        binaryResized = dilated
-        console.log(`[edit-agent] Expanded edit region by ~${expandPx}px for robust inpainting`)
-      } catch {}
+      // Convert binary white=edit to alpha hole
+      const binaryResized = await sharp(dbgBuf).toColourspace('b-w').resize(targetW, targetH, { fit: 'fill' }).toBuffer()
       const alphaHole = await sharp(binaryResized).linear(-1, 255).toBuffer() // alpha=255 outside, 0 inside
       transparentMask = await sharp({ create: { width: targetW, height: targetH, channels: 3, background: { r: 0, g: 0, b: 0 } } })
         .joinChannel(alphaHole)
@@ -512,12 +499,12 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .extractChannel('alpha')
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
-      // Build a stronger multi-scale feathered alpha (continuous, no hard threshold)
+      // Build a multi-scale feathered alpha to reduce seams
       let editAlpha = await sharp(baseAlpha).linear(-1, 255).toBuffer()
-      editAlpha = await sharp(editAlpha).blur(2.5).toBuffer()
-      editAlpha = await sharp(editAlpha).blur(1.6).toBuffer()
-      // Gentle gamma to widen blend band
-      try { editAlpha = await sharp(editAlpha).gamma(0.8).toBuffer() } catch {}
+      // Heavier multi-scale blur + lower threshold to slightly expand the edit region
+      editAlpha = await sharp(editAlpha).blur(2.0).toBuffer()
+      editAlpha = await sharp(editAlpha).blur(1.0).toBuffer()
+      editAlpha = await sharp(editAlpha).threshold(64).toBuffer()
 
       const genRGBA = await sharp(genResized)
         .joinChannel(editAlpha)
@@ -535,6 +522,25 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
 
       processedImageData = `data:image/png;base64,${finalComposite.toString('base64')}`;
       console.log(`Composited generated content into EDIT region at ${targetWidth}x${targetHeight}`);
+
+      // Seamless blend on server for additional smoothing and realism
+      try {
+        const sb = await callModelServer("seamless_blend", {
+          original_image_data: imageData,
+          edited_image_data: processedImageData,
+          mask_png: maskPng,
+          feather_px: 24,
+          pyramid_levels: 5,
+          grain_strength: 0.12,
+          expand_px: 18,
+        }) as { processedImageData: string }
+        if (sb?.processedImageData) {
+          processedImageData = sb.processedImageData
+          console.log("Applied server seamless_blend post-process")
+        }
+      } catch (e) {
+        console.warn("seamless_blend failed or skipped:", e)
+      }
     }
 
     // Save result for debugging
