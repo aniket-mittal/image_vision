@@ -1480,9 +1480,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Match local color/contrast of edited region to surrounding ring
                 try:
-                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
-                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
-                    ring = ((ring_out - ring_in) > 0)
+                    # Build ring from signed distance so it does NOT hug the image borders
+                    try:
+                        binm = (mask_np > 127).astype(np.uint8)
+                        invm = 1 - binm
+                        dist_in = cv2.distanceTransform(binm, cv2.DIST_L2, 3)
+                        dist_out = cv2.distanceTransform(invm, cv2.DIST_L2, 3)
+                        signed = dist_in - dist_out
+                        seam_width = int(max(10, min(40, 0.05 * max(W, H))))
+                        ring = (np.abs(signed) <= float(seam_width))
+                    except Exception:
+                        ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+                        ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
+                        ring = ((ring_out - ring_in) > 0)
                     for c in range(3):
                         region = out_np[:, :, c][mask_np > 127]
                         back = o[:, :, c][ring]

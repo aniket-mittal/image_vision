@@ -517,7 +517,8 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
 
       const finalComposite = await sharp(originalResized)
         .composite([{ input: genRGBA, blend: 'over' }])
-        .png()
+        // Strip any stray metadata and trim tiny 1px transparent borders if present
+        .png({ progressive: false })
         .toBuffer();
 
       processedImageData = `data:image/png;base64,${finalComposite.toString('base64')}`;
@@ -529,10 +530,10 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
           original_image_data: imageData,
           edited_image_data: processedImageData,
           mask_png: maskPng,
-          feather_px: 24,
+          feather_px: 26,
           pyramid_levels: 5,
           grain_strength: 0.12,
-          expand_px: 18,
+          expand_px: 20,
         }) as { processedImageData: string }
         if (sb?.processedImageData) {
           processedImageData = sb.processedImageData
