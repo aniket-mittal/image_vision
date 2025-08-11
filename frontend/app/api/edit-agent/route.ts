@@ -70,24 +70,38 @@ async function saveTempBuffer(buf: Buffer, basename: string) {
 }
 
 async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, height?: number): Promise<Buffer> {
-  // Ensure grayscale 8-bit mask
-  let gray = await sharp(maskBuffer).greyscale().toBuffer();
-  const meta = await sharp(gray).metadata();
-  const w = width || meta.width || 1024;
-  const h = height || meta.height || 1024;
-  // Resize if needed and binarize
-  gray = await sharp(gray)
-    .resize(w, h, { fit: "fill" })
-    .threshold(128)
-    .toBuffer();
-  // Invert to alpha where white (edit) -> 0 (transparent), black (keep) -> 255 (opaque)
-  const alpha = await sharp(gray).linear(-1, 255).toBuffer();
-  // Create an arbitrary RGB base and join alpha channel; API uses only transparency
+  // Extract alpha channel if present; otherwise use grayscale luminance
+  const meta0 = await sharp(maskBuffer).metadata()
+  let baseMask: Buffer
+  if ((meta0.channels || 0) >= 4 && meta0.hasAlpha) {
+    // Use existing alpha (0=transparent edit region, 255=keep)
+    const alphaBuf = await sharp(maskBuffer).ensureAlpha().extractChannel('alpha').toBuffer()
+    baseMask = alphaBuf
+  } else {
+    // Use grayscale of RGB
+    baseMask = await sharp(maskBuffer).toColourspace('b-w').toBuffer()
+  }
+
+  // Normalize size first
+  const meta = await sharp(baseMask).metadata()
+  const w = width || meta.width || 1024
+  const h = height || meta.height || 1024
+  let single = await sharp(baseMask).resize(w, h, { fit: 'fill' }).toBuffer()
+
+  // If coming from alpha, 0=edit. Convert to white=edit for thresholding stats.
+  // Invert so white=edit (255), black=preserve (0)
+  single = await sharp(single).linear(-1, 255).toBuffer()
+
+  // Slight feather: blur then threshold to clean edges
+  single = await sharp(single).blur(0.6).threshold(128).toBuffer()
+
+  // Build final transparent PNG where alpha=255 - white
+  const alphaOut = await sharp(single).linear(-1, 255).toBuffer()
   const rgba = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 0, g: 0, b: 0 } } })
-    .joinChannel(alpha)
+    .joinChannel(alphaOut)
     .png()
-    .toBuffer();
-  return rgba;
+    .toBuffer()
+  return rgba
 }
 
 async function callModelServer(path: string, body: any) {
@@ -224,55 +238,52 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     
     console.log(`Processed image size: ${processedImage.length} chars, mask size: ${processedMask.length} chars`);
     
-    // Validate mask format - ensure it's a proper binary mask
-    let maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
-    const maskImage = await sharp(maskBuffer);
-    const maskMetadata = await maskImage.metadata();
-    
-    console.log(`Mask dimensions: ${maskMetadata.width}x${maskMetadata.height}`);
-    
-    // Analyze mask pixels to ensure it's properly formatted
-    const maskPixels = await maskImage.raw().toBuffer();
-    let whitePixels = 0, blackPixels = 0, otherPixels = 0;
-    
-    for (let i = 0; i < maskPixels.length; i++) {
-      const pixel = maskPixels[i];
-      if (pixel === 255) whitePixels++;
-      else if (pixel === 0) blackPixels++;
-      else otherPixels++;
-    }
-    
-    console.log(`Mask pixel analysis: White (edit areas): ${whitePixels}, Black (preserve): ${blackPixels}, Other: ${otherPixels}`);
-    
-    // Ensure mask is binary (only black and white)
-    if (otherPixels > 0) {
-      console.warn("Mask contains non-binary pixels, converting to binary");
-      const binaryMask = await maskImage
-        .threshold(128) // Convert to binary
-        .png()
-        .toBuffer();
-      const binaryMaskBase64 = `data:image/png;base64,${binaryMask.toString('base64')}`;
-      processedMask = binaryMaskBase64;
-      maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
-    }
-    
-    // Get original image dimensions for aspect ratio preservation
+    // Decode buffers
     const imageBuffer = Buffer.from(processedImage.split(',')[1], 'base64');
-    const image = await sharp(imageBuffer);
-    const imageMetadata = await image.metadata();
-    
-    console.log(`Image dimensions: ${imageMetadata.width}x${imageMetadata.height}`);
-    
+    let maskBuffer = Buffer.from(processedMask.split(',')[1], 'base64');
+
+    // Determine final size for mask (match processed image)
+    const imageMeta = await sharp(imageBuffer).metadata()
+    const targetW = imageMeta.width || 1024
+    const targetH = imageMeta.height || Math.round(targetW / 1.0)
+
+    // Build transparent PNG mask using alpha if present
+    const transparentMask = await buildTransparentMaskPng(maskBuffer, targetW, targetH)
+
+    // For statistics, analyze the binary edit mask (white=edit) used to create alpha
+    const editMaskForStats = await sharp(transparentMask).ensureAlpha().extractChannel('alpha').linear(-1, 255).toBuffer()
+    const statsMeta = await sharp(editMaskForStats).metadata()
+    const statsRaw = await sharp(editMaskForStats).raw().toBuffer()
+    let whitePixels = 0, blackPixels = 0
+    for (let i = 0; i < statsRaw.length; i++) {
+      const v = statsRaw[i]
+      if (v === 255) whitePixels++
+      else if (v === 0) blackPixels++
+    }
+    console.log(`Mask dimensions: ${targetW}x${targetH}`)
+    console.log(`Mask pixel analysis: White(edit): ${whitePixels}, Black(keep): ${blackPixels}`)
+
+    // Save debug artifacts
+    try {
+      await saveTempBuffer(imageBuffer, 'openai_input_image.png')
+      await saveTempBuffer(maskBuffer, 'openai_binary_mask_input.png')
+      await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
+      const workspaceTempDir = join(process.cwd(), 'temp')
+      await mkdir(workspaceTempDir, { recursive: true })
+      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_input_image.png`), imageBuffer)
+      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_mask_transparent.png`), transparentMask)
+    } catch (e) {
+      console.warn('Failed saving OpenAI debug artifacts:', e)
+    }
+
     // Create FormData for OpenAI API
     const formData = new FormData();
     formData.append('image', new Blob([imageBuffer], { type: 'image/png' }), 'image.png');
-    // Build a transparent PNG mask (alpha indicates edit region)
-    const transparentMask = await buildTransparentMaskPng(maskBuffer);
     formData.append('mask', new Blob([transparentMask], { type: 'image/png' }), 'mask.png');
     formData.append('model', 'gpt-image-1');
     formData.append('prompt', prompt);
     formData.append('n', '1');
-    formData.append('size', '1024x1024'); // OpenAI edits always return 1024x1024
+    formData.append('size', '1024x1024');
     
     console.log("Sending request to OpenAI with:");
     console.log(`- Image size: ${imageBuffer.length} bytes`);
