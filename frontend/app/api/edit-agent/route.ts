@@ -42,6 +42,14 @@ async function saveTempDataUrl(dataUrl: string, basename: string) {
   const buf = Buffer.from(base64, "base64")
   const outPath = join(tempDir, `${Date.now()}_${basename}`)
   await writeFile(outPath, buf)
+  
+  // Also mirror into workspace local temp folder for easy inspection
+  try {
+    const workspaceTempDir = join(process.cwd(), "temp")
+    await mkdir(workspaceTempDir, { recursive: true })
+    const wsOutPath = join(workspaceTempDir, `${Date.now()}_${basename}`)
+    await writeFile(wsOutPath, buf)
+  } catch {}
   return outPath
 }
 
@@ -50,6 +58,14 @@ async function saveTempBuffer(buf: Buffer, basename: string) {
   await mkdir(tempDir, { recursive: true })
   const outPath = join(tempDir, `${Date.now()}_${basename}`)
   await writeFile(outPath, buf)
+  
+  // Also mirror into workspace local temp folder for easy inspection
+  try {
+    const workspaceTempDir = join(process.cwd(), "temp")
+    await mkdir(workspaceTempDir, { recursive: true })
+    const wsOutPath = join(workspaceTempDir, `${Date.now()}_${basename}`)
+    await writeFile(wsOutPath, buf)
+  } catch {}
   return outPath
 }
 
@@ -143,12 +159,14 @@ async function buildMask(imagePath: string, imageData: string, prompt: string, o
     dilate_px: opts?.dilate ?? 2,
     feather_px: opts?.feather ?? 2,
     // Use higher thresholds for more precise detection
-    box_threshold: 0.45,
-    text_threshold: 0.35,
+    box_threshold: 0.55,
+    text_threshold: 0.45,
     // Enable advanced refinement
     enable_fba_refine: true,
     enable_controlnet: false, // Disable for edit mode to avoid conflicts
     return_rgba: true,
+    keep_largest: true,
+    min_area_frac: 0.002,
   }
   return callModelServer("mask_from_text", body) as Promise<{ mask_png: string; mask_binary_shape: number[]; mask_binary_sum: number }>
 }
@@ -276,6 +294,11 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       await saveTempBuffer(imageBuffer, 'openai_input_image.png')
       await saveTempBuffer(maskBuffer, 'openai_binary_mask.png')
       await saveTempBuffer(transparentMask, 'openai_transparent_mask.png')
+      // Also dump a copy of the exact payload images in workspace temp
+      const workspaceTempDir = join(process.cwd(), 'temp')
+      await mkdir(workspaceTempDir, { recursive: true })
+      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_input_image.png`), imageBuffer)
+      await writeFile(join(workspaceTempDir, `${Date.now()}_openai_mask_transparent.png`), transparentMask)
     } catch (e) {
       console.warn('Failed saving OpenAI debug artifacts:', e)
     }
@@ -644,20 +667,20 @@ export async function POST(req: NextRequest) {
       const wantsContrast = /(contrast|clarity|punch|vibrance|saturation)/.test(t)
       const wantsDenoise = /(denoise|noise|grain|smooth|clean)/.test(t)
       const wantsWhiteBalance = /(white balance|color balance|temperature|tint|warm|cool|neutral)/.test(t)
-      const wantsHighlights = /(highlights|specular|glow|shine)/.test(t)
-      const wantsShadows = /(shadows|shadow detail|dark areas)/.test(t)
+      const wantsHighlights = /(highlights|specular|glow|shine|recover highlights|reduce highlights|enhance highlights)/.test(t)
+      const wantsShadows = /(shadows|shadow detail|dark areas|lift shadows|recover shadows|deepen shadows)/.test(t)
 
       const params = {
         gamma: wantsBrighter ? 0.8 : wantsDarker ? 1.15 : 0.95,
         clahe: wantsContrast || wantsHighlights || wantsShadows ? true : false,
-        unsharp_amount: wantsContrast ? 0.4 : wantsHighlights ? 0.25 : 0.15,
+        unsharp_amount: wantsContrast ? 0.45 : wantsHighlights ? 0.25 : 0.15,
         unsharp_radius: wantsContrast ? 4 : wantsHighlights ? 3 : 2,
         denoise: wantsDenoise,
         white_balance: wantsWhiteBalance,
         // Add advanced lighting controls
-        highlights: wantsHighlights ? 0.3 : 0.0,
-        shadows: wantsShadows ? 0.4 : 0.0,
-        vibrance: wantsContrast ? 0.2 : 0.0,
+        highlights: wantsHighlights ? (wantsHighlights && wantsContrast ? 0.35 : 0.25) : 0.0,
+        shadows: wantsShadows ? (wantsShadows && wantsContrast ? 0.45 : 0.35) : 0.0,
+        vibrance: wantsContrast ? 0.25 : 0.0,
         mask_png: maskPng,
       }
       console.log("[edit-agent] Enhancing image locally with params:", params)
