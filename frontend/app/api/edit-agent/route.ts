@@ -35,6 +35,27 @@ async function saveTempImage(imageData: string, basename = "edit_input.jpg") {
   return { imagePath, tempDir }
 }
 
+async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, height?: number): Promise<Buffer> {
+  // Ensure grayscale 8-bit mask
+  let gray = await sharp(maskBuffer).greyscale().toBuffer();
+  const meta = await sharp(gray).metadata();
+  const w = width || meta.width || 1024;
+  const h = height || meta.height || 1024;
+  // Resize if needed and binarize
+  gray = await sharp(gray)
+    .resize(w, h, { fit: "fill" })
+    .threshold(128)
+    .toBuffer();
+  // Invert to alpha where white (edit) -> 0 (transparent), black (keep) -> 255 (opaque)
+  const alpha = await sharp(gray).linear(-1, 255).toBuffer();
+  // Create an arbitrary RGB base and join alpha channel; API uses only transparency
+  const rgba = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+    .joinChannel(alpha)
+    .png()
+    .toBuffer();
+  return rgba;
+}
+
 async function callModelServer(path: string, body: any) {
   console.log(`[edit-agent] Calling model server: ${path}`)
   try {
@@ -201,14 +222,17 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
     // Create FormData for OpenAI API
     const formData = new FormData();
     formData.append('image', new Blob([imageBuffer], { type: 'image/png' }), 'image.png');
-    formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+    // Build a transparent PNG mask (alpha indicates edit region)
+    const transparentMask = await buildTransparentMaskPng(maskBuffer);
+    formData.append('mask', new Blob([transparentMask], { type: 'image/png' }), 'mask.png');
+    formData.append('model', 'gpt-image-1');
     formData.append('prompt', prompt);
     formData.append('n', '1');
     formData.append('size', '1024x1024'); // OpenAI edits always return 1024x1024
     
     console.log("Sending request to OpenAI with:");
     console.log(`- Image size: ${imageBuffer.length} bytes`);
-    console.log(`- Mask size: ${maskBuffer.length} bytes`);
+    console.log(`- Mask size: ${transparentMask.length} bytes`);
     console.log(`- Prompt: "${prompt}"`);
     console.log(`- Size: 1024x1024`);
     
