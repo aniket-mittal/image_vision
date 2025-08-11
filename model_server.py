@@ -82,7 +82,7 @@ _FBA = {
 
 # Fallback inpainting method using OpenCV
 def cv2_inpaint_fallback(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Simple inpainting fallback using OpenCV's TELEA algorithm"""
+    """Simple inpainting fallback using OpenCV's TELEA algorithm """
     try:
         # Ensure mask is binary and uint8
         if mask.dtype != np.uint8:
@@ -1346,9 +1346,9 @@ class Handler(BaseHTTPRequestHandler):
                 orig_data = payload.get("original_image_data")
                 edited_data = payload.get("edited_image_data")
                 mask_png = payload.get("mask_png", "")
-                feather_px = int(payload.get("feather_px", 8))
+                feather_px = int(payload.get("feather_px", 16))
                 add_grain = bool(payload.get("add_grain", True))
-                grain_strength = float(payload.get("grain_strength", 0.08))
+                grain_strength = float(payload.get("grain_strength", 0.1))
                 if not orig_data or not edited_data or not mask_png:
                     return self._send(400, {"error": "original_image_data, edited_image_data, and mask_png are required"})
 
@@ -1384,14 +1384,26 @@ class Handler(BaseHTTPRequestHandler):
                 if mask_np.mean() < 127:
                     mask_np = 255 - mask_np
 
-                # Feather for soft boundaries in later alpha blend
-                # Aggressive multi-scale feather for seamless boundary
+                # Distance-transform based feather for smooth, realistic seam
                 try:
+                    binm = (mask_np > 127).astype(np.uint8)
+                    invm = 1 - binm
+                    dist_in = cv2.distanceTransform(binm, cv2.DIST_L2, 3)
+                    dist_out = cv2.distanceTransform(invm, cv2.DIST_L2, 3)
+                    signed = dist_in - dist_out  # positive inside, negative outside
+                    ys, xs = np.where(binm > 0)
+                    if ys.size and xs.size:
+                        obj_w = max(1, int(xs.max() - xs.min()))
+                        obj_h = max(1, int(ys.max() - ys.min()))
+                        k = max(feather_px, int(0.02 * max(obj_w, obj_h)))
+                    else:
+                        k = feather_px
+                    mask_soft_f = 1.0 / (1.0 + np.exp(-signed / max(1.0, float(k))))
+                    mask_soft = (mask_soft_f * 255.0).astype(np.uint8)
+                except Exception:
                     sigma = max(2.0, float(feather_px))
                     mask_soft = cv2.GaussianBlur(mask_np, (0, 0), sigma)
                     mask_soft = cv2.GaussianBlur(mask_soft, (0, 0), sigma * 0.5)
-                except Exception:
-                    mask_soft = mask_np
 
                 o = np.array(pil_o)
                 e = np.array(pil_e)
@@ -1420,8 +1432,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Match local color/contrast of edited region to surrounding ring
                 try:
-                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
-                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61)))
+                    ring_in = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+                    ring_out = cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
                     ring = ((ring_out - ring_in) > 0)
                     for c in range(3):
                         region = out_np[:, :, c][mask_np > 127]
@@ -1448,8 +1460,12 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                         gstd = max(0.0, min(0.2, noise_level * 0.6 + grain_strength))
+                        # Apply grain only within a seam band
+                        seam_band = ((cv2.dilate((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))) -
+                                      cv2.erode((mask_np > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))) > 0)
                         noise = np.random.normal(0.0, gstd * 255.0, size=out_np.shape).astype(np.float32)
-                        out_np = np.clip(out_np.astype(np.float32) + noise * ((mask_np > 127)[..., None].astype(np.float32)), 0, 255).astype(np.uint8)
+                        mask3 = np.stack([seam_band]*3, axis=-1).astype(np.float32)
+                        out_np = np.clip(out_np.astype(np.float32) + noise * mask3, 0, 255).astype(np.uint8)
                     except Exception as _e_grain:
                         print("[ModelServer] grain add failed:", _e_grain)
 
