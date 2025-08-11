@@ -499,11 +499,12 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .extractChannel('alpha')
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
-      // Build a multi-scale feathered alpha to reduce seams
+      // Build a stronger multi-scale feathered alpha (continuous, no hard threshold)
       let editAlpha = await sharp(baseAlpha).linear(-1, 255).toBuffer()
-      editAlpha = await sharp(editAlpha).blur(1.2).toBuffer()
-      editAlpha = await sharp(editAlpha).blur(0.8).toBuffer()
-      editAlpha = await sharp(editAlpha).threshold(96).toBuffer()
+      editAlpha = await sharp(editAlpha).blur(2.5).toBuffer()
+      editAlpha = await sharp(editAlpha).blur(1.6).toBuffer()
+      // Gentle gamma to widen blend band
+      try { editAlpha = await sharp(editAlpha).gamma(0.8).toBuffer() } catch {}
 
       const genRGBA = await sharp(genResized)
         .joinChannel(editAlpha)

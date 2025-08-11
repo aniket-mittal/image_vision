@@ -1346,7 +1346,7 @@ class Handler(BaseHTTPRequestHandler):
                 orig_data = payload.get("original_image_data")
                 edited_data = payload.get("edited_image_data")
                 mask_png = payload.get("mask_png", "")
-                feather_px = int(payload.get("feather_px", 16))
+                feather_px = int(payload.get("feather_px", 28))
                 add_grain = bool(payload.get("add_grain", True))
                 grain_strength = float(payload.get("grain_strength", 0.1))
                 if not orig_data or not edited_data or not mask_png:
@@ -1395,7 +1395,7 @@ class Handler(BaseHTTPRequestHandler):
                     if ys.size and xs.size:
                         obj_w = max(1, int(xs.max() - xs.min()))
                         obj_h = max(1, int(ys.max() - ys.min()))
-                        k = max(feather_px, int(0.02 * max(obj_w, obj_h)))
+                        k = max(feather_px, int(0.035 * max(obj_w, obj_h)))
                     else:
                         k = feather_px
                     mask_soft_f = 1.0 / (1.0 + np.exp(-signed / max(1.0, float(k))))
@@ -1455,7 +1455,7 @@ class Handler(BaseHTTPRequestHandler):
                             img = cv2.pyrUp(img, dstsize=size)
                             img = img + lp[i]
                         return img
-                    levels = int(payload.get("pyramid_levels", 4))
+                    levels = int(payload.get("pyramid_levels", 5))
                     m_soft = (mask_soft.astype(np.float32) / 255.0)
                     m3 = np.dstack([m_soft]*3)
                     lp_o = _lap_pyr(o.astype(np.float32), levels)
