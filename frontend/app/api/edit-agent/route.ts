@@ -70,35 +70,44 @@ async function saveTempBuffer(buf: Buffer, basename: string) {
 }
 
 async function buildTransparentMaskPng(maskBuffer: Buffer, width?: number, height?: number): Promise<Buffer> {
-  // Extract alpha channel if present; otherwise use grayscale luminance
+  // Standardize mask to: alpha = 0 in edit region, 255 elsewhere
   const meta0 = await sharp(maskBuffer).metadata()
-  let baseMask: Buffer
-  if ((meta0.channels || 0) >= 4 && meta0.hasAlpha) {
-    // Use existing alpha (0=transparent edit region, 255=keep)
-    const alphaBuf = await sharp(maskBuffer).ensureAlpha().extractChannel('alpha').toBuffer()
-    baseMask = alphaBuf
+  const hasAlpha = (meta0.channels || 0) >= 4 && !!meta0.hasAlpha
+  const w = width || meta0.width || 1024
+  const h = height || meta0.height || 1024
+
+  let editMaskFloat: Buffer
+  if (hasAlpha) {
+    // Extract alpha and interpret alpha=0 as edit region
+    const alphaResized = await sharp(maskBuffer)
+      .ensureAlpha()
+      .extractChannel('alpha')
+      .resize(w, h, { fit: 'fill' })
+      .toBuffer()
+    // Convert to white=edit for processing: edit = 255 - alpha
+    editMaskFloat = await sharp(alphaResized).linear(-1, 255).toBuffer()
   } else {
-    // Use grayscale of RGB
-    baseMask = await sharp(maskBuffer).toColourspace('b-w').toBuffer()
+    // Grayscale assumed white=edit
+    const gray = await sharp(maskBuffer).toColourspace('b-w').resize(w, h, { fit: 'fill' }).toBuffer()
+    editMaskFloat = gray
   }
 
-  // Normalize size first
-  const meta = await sharp(baseMask).metadata()
-  const w = width || meta.width || 1024
-  const h = height || meta.height || 1024
-  let single = await sharp(baseMask).resize(w, h, { fit: 'fill' }).toBuffer()
+  // Feather and binarize to clean edges
+  const editFeathered = await sharp(editMaskFloat).blur(0.6).threshold(128).toBuffer()
 
-  // If coming from alpha, 0=edit. Convert to white=edit for thresholding stats.
-  // Invert so white=edit (255), black=preserve (0)
-  single = await sharp(single).linear(-1, 255).toBuffer()
+  // Build final alpha where 0 in edit region
+  const finalAlpha = await sharp(editFeathered).linear(-1, 255).toBuffer()
 
-  // Slight feather: blur then threshold to clean edges
-  single = await sharp(single).blur(0.6).threshold(128).toBuffer()
+  // Debug: compute coverage
+  try {
+    const raw = await sharp(editFeathered).raw().toBuffer()
+    let countWhite = 0
+    for (let i = 0; i < raw.length; i++) if (raw[i] === 255) countWhite++
+    console.log(`[edit-agent] buildTransparentMaskPng: edit white pixels=${countWhite} of ${w*h}`)
+  } catch {}
 
-  // Build final transparent PNG where alpha=255 - white
-  const alphaOut = await sharp(single).linear(-1, 255).toBuffer()
   const rgba = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 0, g: 0, b: 0 } } })
-    .joinChannel(alphaOut)
+    .joinChannel(finalAlpha)
     .png()
     .toBuffer()
   return rgba
@@ -258,24 +267,24 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
       sourceMaskBuf = Buffer.from(maskPng, 'base64')
     }
 
-    // If the mask already has an alpha channel, prefer it directly; otherwise construct one
+    // Always standardize the mask to "transparent where to edit"
+    // This avoids pass-through of opaque RGBA masks (e.g., from matting_refine)
     let transparentMask: Buffer
     try {
-      const srcMeta = await sharp(sourceMaskBuf).metadata()
-      if ((srcMeta.channels || 0) >= 4 && srcMeta.hasAlpha) {
+      transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
+      console.log('[edit-agent] Standardized mask to transparent-hole PNG for OpenAI')
+    } catch (e) {
+      console.warn('[edit-agent] Failed to standardize mask; attempting raw alpha path:', e)
+      try {
         transparentMask = await sharp(sourceMaskBuf)
           .ensureAlpha()
           .resize(targetW, targetH, { fit: 'fill' })
           .png()
           .toBuffer()
-        console.log(`[edit-agent] Using alpha from server mask (channels=${srcMeta.channels})`)
-      } else {
+      } catch (e2) {
+        console.warn('[edit-agent] Raw alpha path failed; rebuilding by grayscale:', e2)
         transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
-        console.log(`[edit-agent] Built transparent mask from grayscale server mask (channels=${srcMeta.channels})`)
       }
-    } catch (e) {
-      console.warn('[edit-agent] Mask metadata read failed; rebuilding:', e)
-      transparentMask = await buildTransparentMaskPng(sourceMaskBuf, targetW, targetH)
     }
 
     // For statistics, analyze the binary edit mask used to create alpha (white=edit)
