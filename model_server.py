@@ -1525,7 +1525,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 # Use detector boxes to disambiguate orientation if needed
                 try:
-                    if boxes:
+                    if isinstance(boxes, (list, tuple)) and len(boxes) > 0:
                         boxes_mask = np.zeros((H, W), dtype=np.uint8)
                         for b in boxes:
                             # GroundingDINO returns (cx, cy, w, h) normalized
@@ -1569,6 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 pre_cc = int(bin_mask.sum())
                 print(f"[ModelServer] mask_from_text: bin before filtering sum={pre_cc}")
+                pre_filter_bin = bin_mask.copy()
                 if keep_largest:
                     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
                     if num_labels > 1:
@@ -1586,6 +1587,10 @@ class Handler(BaseHTTPRequestHandler):
                         if stats[i, cv2.CC_STAT_AREA] >= min_area:
                             keep[labels == i] = 1
                     bin_mask = keep
+                    if bin_mask.sum() == 0 and pre_filter_bin.sum() > 0:
+                        # If filtering removed everything (e.g., small birds), keep pre-filter result
+                        print(f"[ModelServer] mask_from_text: area filter removed all; restoring pre-filter mask (min_area={min_area})")
+                        bin_mask = pre_filter_bin
                     print(f"[ModelServer] mask_from_text: removed small components under {min_area} px")
 
                 # Dilation and feathering
