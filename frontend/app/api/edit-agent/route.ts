@@ -295,12 +295,11 @@ async function openAIImagesEdit(imageData: string, maskPng: string, prompt: stri
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .toBuffer();
 
-      // Resize mask to original aspect ratio dimensions and prepare as 8-bit alpha (feather slightly)
+      // Resize mask to original aspect ratio dimensions and prepare as 8-bit alpha
       const maskAlpha = await sharp(maskBuffer)
         .resize(targetWidth, targetHeight, { fit: 'fill' })
         .threshold(128)
         .toColourspace('b-w')
-        .blur(0.7)
         .ensureAlpha() // guarantees an alpha channel exists
         .removeAlpha() // keep single channel grayscale
         .toBuffer();
@@ -354,23 +353,23 @@ async function stabilityInpaint(imageData: string, maskPng: string, prompt: stri
   form.append("image", new Blob([imageBuf], { type: "image/png" }), "image.png")
   form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png")
     
-  const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
-    method: "POST",
-    headers: { 
-      Authorization: `Bearer ${STABILITY_API_KEY}`,
+    const r = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
+      method: "POST",
+      headers: { 
+        Authorization: `Bearer ${STABILITY_API_KEY}`,
         Accept: "application/json, image/*"
-    },
-    body: form as any,
-  })
+      },
+      body: form as any,
+    })
     
-  if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
+    if (!r.ok) throw new Error(`stability ${r.status}: ${await r.text()}`)
     
-  const contentType = r.headers.get("content-type") || ""
-  if (contentType.includes("application/json")) {
-    const j = await r.json()
-    const b64 = j?.artifacts?.[0]?.base64
+    const contentType = r.headers.get("content-type") || ""
+    if (contentType.includes("application/json")) {
+      const j = await r.json()
+      const b64 = j?.artifacts?.[0]?.base64
       if (b64) {
-    return { processedImageData: `data:image/png;base64,${b64}` }
+        return { processedImageData: `data:image/png;base64,${b64}` }
       }
       // Fallback: sometimes the API returns an image despite JSON header confusion
       const alt = await fetch("https://api.stability.ai/v2beta/stable-image/edit/inpaint", {
@@ -657,7 +656,7 @@ export async function POST(req: NextRequest) {
 
     if (aiModel === "SDXL") {
       // Use the user's instruction verbatim for adaptability
-      const prompt = `${instruction}. Only modify pixels within the provided mask; preserve all other regions exactly.`
+      const prompt = instruction
       let params: any = { guidance_scale: 6.0, num_inference_steps: 30, use_canny: true, use_depth: false }
       let attempt = 0
       let best = null as any
@@ -689,7 +688,7 @@ export async function POST(req: NextRequest) {
 
     if (aiModel === "OpenAIImages") {
       // Use the user's instruction verbatim for adaptability
-      const prompt: string = `${instruction}. Only modify pixels within the transparent mask region; keep all other areas identical.`
+      const prompt: string = instruction
       
       console.log(`[edit-agent] Generated OpenAI prompt: "${prompt}"`)
       console.log(`[edit-agent] Starting OpenAI image edit...`)

@@ -214,7 +214,7 @@ def ensure_fba_loaded(device: str = None):
         # Try multiple import strategies for FBA
         fba_module = None
         import_errors = []
-        
+
         # Strategy 1: Try importing from networks.models (actual structure from demo.py)
         try:
             # Add the repository root to sys.path first
@@ -225,7 +225,7 @@ def ensure_fba_loaded(device: str = None):
             print("[ModelServer] FBA imported successfully from networks.models (build_model)")
         except ImportError as e:
             import_errors.append(f"networks.models import failed: {e}")
-        
+
         # Strategy 2: Try importing from networks directory directly
         if fba_module is None:
             try:
@@ -237,7 +237,7 @@ def ensure_fba_loaded(device: str = None):
                 print("[ModelServer] FBA imported successfully from networks directory models")
             except ImportError as e:
                 import_errors.append(f"networks directory models import failed: {e}")
-        
+
         # Strategy 3: Try importing from nets (fallback for different repo versions)
         if fba_module is None:
             try:
@@ -249,7 +249,7 @@ def ensure_fba_loaded(device: str = None):
                 print("[ModelServer] FBA imported successfully from nets/FBA")
             except ImportError as e:
                 import_errors.append(f"nets/FBA import failed: {e}")
-        
+
         # Strategy 4: Try direct import from nets (legacy)
         if fba_module is None:
             try:
@@ -258,7 +258,7 @@ def ensure_fba_loaded(device: str = None):
                 print("[ModelServer] FBA imported successfully from nets")
             except ImportError as e:
                 import_errors.append(f"nets import failed: {e}")
-        
+
         if fba_module is None:
             print(f"[ModelServer] FBA import failed after all strategies. Errors: {import_errors}")
             print("[ModelServer] FBA Matting not available - some features may be limited")
@@ -310,7 +310,7 @@ def ensure_fba_loaded(device: str = None):
                 net = fba_module()
             checkpoint = torch.load(ckpt, map_location=device)
             net.load_state_dict(checkpoint)
-            
+
             # Move to device and set to eval mode
             net.to(device).eval()
             _FBA["net"] = net
@@ -1052,34 +1052,32 @@ class Handler(BaseHTTPRequestHandler):
                             print("[ModelServer] rembg refine failed, will fallback:", _e)
                             refined = None
                     else:
+                        # Use the correct FBA API from demo.py - requires 4 arguments
                         try:
-                            # Use the correct FBA API from demo.py - requires 4 arguments
-                            try:
-                                from networks.transforms import trimap_transform, normalise_image
-                            except ImportError as transform_error:
-                                print(f"[ModelServer] FBA transforms not available: {transform_error}")
-                                print("[ModelServer] FBA refine will use fallback method")
-                                refined = None
-                                raise Exception("FBA transforms not available")
-                            
+                            from networks.transforms import trimap_transform, normalise_image
+                        except ImportError as transform_error:
+                            print(f"[ModelServer] FBA transforms not available: {transform_error}")
+                            print("[ModelServer] FBA refine will use fallback method")
+                            refined = None
+                        else:
                             # Build a pseudo-trimap from soft mask (2-channel format as expected by FBA)
                             fg = (mask_np > 0.9).astype(np.uint8)
                             bg = (mask_np < 0.1).astype(np.uint8)
-                            
+
                             # Create 2-channel trimap as expected by FBA
                             trimap_2ch = np.stack([bg, fg], axis=-1).astype(np.float32)
-                            
+
                             # Scale inputs to multiple of 8 (FBA requirement)
                             def scale_input(x, scale=1.0):
                                 h, w = x.shape[:2]
                                 h1 = int(np.ceil(scale * h / 8) * 8)
                                 w1 = int(np.ceil(scale * w / 8) * 8)
                                 return cv2.resize(x, (w1, h1), interpolation=cv2.INTER_LANCZOS4)
-                            
+
                             # Scale image and trimap
                             image_scaled = scale_input(np.array(pil).astype(np.float32) / 255.0)
                             trimap_scaled = scale_input(trimap_2ch.astype(np.float32))
-                            
+
                             # Build tensors exactly like demo.py (np_to_torch) on CUDA if available
                             device = next(net.parameters()).device
                             model_dtype = next(net.parameters()).dtype
@@ -1093,49 +1091,28 @@ class Handler(BaseHTTPRequestHandler):
                             img_t = np_to_torch(image_scaled, permute=True)
                             trimap_t = np_to_torch(trimap_scaled, permute=True)
 
-                            trimap_transformed_torch = np_to_torch(trimap_transform(trimap_scaled), permute=False)
+                            trimap_transformed_torch = torch.from_numpy(trimap_transform(trimap_scaled)).unsqueeze(0).to(device=device, dtype=model_dtype)
                             image_transformed_torch = normalise_image(img_t.clone()).to(device=device, dtype=model_dtype)
-                            
-                            # Double-check all tensors are on the same device
-                            try:
-                                assert img_t.device == device, f"Image tensor on {img_t.device}, expected {device}"
-                                assert trimap_t.device == device, f"Trimap tensor on {trimap_t.device}, expected {device}"
-                                assert trimap_transformed_torch.device == device, f"Trimap transformed on {trimap_transformed_torch.device}, expected {device}"
-                                assert image_transformed_torch.device == device, f"Image transformed on {image_transformed_torch.device}, expected {device}"
-                                
-                                print(f"[ModelServer] All tensors moved to device: {device}")
-                                print(f"[ModelServer] Tensor devices - img_t: {img_t.device}, trimap_t: {trimap_t.device}, trimap_transformed: {trimap_transformed_torch.device}, image_transformed: {image_transformed_torch.device}")
-                            except AssertionError as device_error:
-                                print(f"[ModelServer] Device mismatch detected: {device_error}")
-                                print("[ModelServer] Attempting to fix device mismatch...")
-                                
-                                # Force move all tensors to the correct device
-                                img_t = img_t.to(device)
-                                trimap_t = trimap_t.to(device)
-                                trimap_transformed_torch = trimap_transformed_torch.to(device)
-                                image_transformed_torch = image_transformed_torch.to(device)
-                                
-                                print(f"[ModelServer] Forced device correction - all tensors now on {device}")
-                            
+
                             # Ensure model itself is on correct device as well
                             try:
                                 net = net.to(device)
                             except Exception:
                                 pass
+
                             # Call FBA with correct 4 arguments
-                        with torch.no_grad():
-                                 output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
-                                # Extract alpha channel and resize back to original size
-                                if isinstance(output, (list, tuple)):
-                                    output = output[0]
-                                # FBA returns [alpha, fg, bg] - we want alpha
-                                alpha_scaled = output[0, 0].cpu().numpy()
-                                # Resize back to original dimensions
-                                alpha = cv2.resize(alpha_scaled, (W, H), interpolation=cv2.INTER_LANCZOS4)
+                            with torch.no_grad():
+                                output = net(img_t, trimap_t, image_transformed_torch, trimap_transformed_torch)
+
+                            # Extract alpha channel and resize back to original size
+                            if isinstance(output, (list, tuple)):
+                                output = output[0]
+                            # FBA returns [alpha, fg, bg] - we want alpha
+                            alpha_scaled = output[0, 0].detach().cpu().numpy()
+                            # Resize back to original dimensions
+                            alpha = cv2.resize(alpha_scaled, (W, H), interpolation=cv2.INTER_LANCZOS4)
                             refined = np.clip(alpha, 0.0, 1.0)
-                    except Exception as _e:
-                        print("[ModelServer] FBA refine failed, will fallback:", _e)
-                        refined = None
+                            print("[ModelServer] FBA refine successful using correct 4-argument API")
                 if refined is None:
                     # Fallback: edge-aware feather using distance transform
                     import cv2
@@ -1293,9 +1270,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 image_path = ensure_image_path(payload)
                 prompt = payload.get("prompt", "object")
-                # Allow server-side auto tuning when not provided
-                dilate_px = payload.get("dilate_px", None)
-                feather_px = payload.get("feather_px", None)
+                dilate_px = int(payload.get("dilate_px", 3))
+                feather_px = int(payload.get("feather_px", 3))
                 return_rgba = bool(payload.get("return_rgba", True))
                 if not image_path or not os.path.exists(image_path):
                     return self._send(400, {"error": "invalid image_path"})
@@ -1305,24 +1281,6 @@ class Handler(BaseHTTPRequestHandler):
                 masks, boxes, phrases = [], [], []
                 try:
                     _masks, _boxes, _phrases = DETECTOR.detect_and_segment(image=image_path, text_prompt=prompt)
-                    # Filter masks by phrases that overlap with prompt tokens
-                    if _phrases:
-                        pnorm = prompt.lower()
-                        sel = []
-                        for i, phr in enumerate(_phrases):
-                            if isinstance(phr, str) and any(tok.strip() and tok.strip() in pnorm for tok in phr.lower().split()):
-                                sel.append(i)
-                        if not sel:
-                            # fallback to the largest mask if no phrase match
-                            try:
-                                areas = [float((_masks[i] > 0.5).sum()) for i in range(len(_masks))]
-                                sel = [int(np.argmax(areas))]
-                            except Exception:
-                                sel = list(range(len(_masks)))
-                        masks = [_masks[i] for i in sel]
-                        boxes = [_boxes[i] for i in sel] if _boxes else []
-                        phrases = [_phrases[i] for i in sel]
-                    else:
                     masks, boxes, phrases = _masks, _boxes, _phrases
                 except Exception as e:
                     print("[ModelServer] mask_from_text detection error:", e)
@@ -1341,34 +1299,8 @@ class Handler(BaseHTTPRequestHandler):
                     if m.shape != (H, W):
                         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                     combined = np.maximum(combined, m)
-                # Compute area and auto-tune morphology if not specified
-                bin_mask = (combined > 0.5).astype(np.uint8) * 255
-                nonzero = np.count_nonzero(bin_mask)
-                area_ratio = nonzero / float(H * W)
-                if dilate_px is None or feather_px is None:
-                    if area_ratio < 0.02:
-                        auto_dilate, auto_feather = 6, 6
-                    elif area_ratio < 0.08:
-                        auto_dilate, auto_feather = 4, 4
-                    elif area_ratio < 0.2:
-                        auto_dilate, auto_feather = 3, 3
-                    else:
-                        auto_dilate, auto_feather = 2, 2
-                    dilate_px = int(dilate_px) if dilate_px is not None else auto_dilate
-                    feather_px = int(feather_px) if feather_px is not None else auto_feather
-                # Constrain mask to expanded bbox to prevent background drift
-                ys, xs = np.where(bin_mask > 0)
-                if ys.size and xs.size:
-                    y1, y2 = ys.min(), ys.max()
-                    x1, x2 = xs.min(), xs.max()
-                    margin_y = int(max(5, 0.05 * (y2 - y1)))
-                    margin_x = int(max(5, 0.05 * (x2 - x1)))
-                    y1 = max(0, y1 - margin_y); y2 = min(H - 1, y2 + margin_y)
-                    x1 = max(0, x1 - margin_x); x2 = min(W - 1, x2 + margin_x)
-                    constrained = np.zeros_like(bin_mask)
-                    constrained[y1:y2+1, x1:x2+1] = bin_mask[y1:y2+1, x1:x2+1]
-                    bin_mask = constrained
                 # Mask hygiene: dilate then feather
+                bin_mask = (combined > 0.5).astype(np.uint8) * 255
                 if dilate_px > 0:
                     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*dilate_px+1), max(1, 2*dilate_px+1)))
                     bin_mask = cv2.dilate(bin_mask, k, iterations=1)
@@ -1390,7 +1322,6 @@ class Handler(BaseHTTPRequestHandler):
                     "mask_png": f"data:image/png;base64,{mask_png_b64}",
                     "mask_binary_shape": [H, W],
                     "mask_binary_sum": int((soft>0.5).sum()),
-                    "mask_area_ratio": float(area_ratio),
                 })
             except Exception as e:
                 print("[ModelServer] mask_from_text error:", e)
@@ -1486,10 +1417,15 @@ class Handler(BaseHTTPRequestHandler):
                 image_path = ensure_image_path(payload)
                 mask_png = payload.get("mask_png", "")
                 prompt = payload.get("prompt", "")
-                negative_prompt = payload.get("negative_prompt", "low quality, blurry, artifacts")
+                # Encourage photo-realism and discourage cartoon/texture artifacts
+                negative_prompt = payload.get(
+                    "negative_prompt",
+                    "low quality, blurry, cartoon, illustration, anime, painting, cgi, 3d render, repetitive texture, pattern"
+                )
                 guidance_scale = float(payload.get("guidance_scale", 6.0))
                 num_inference_steps = int(payload.get("num_inference_steps", 30))
-                use_canny = bool(payload.get("use_canny", True))
+                # Default off to avoid strong line-art bias
+                use_canny = bool(payload.get("use_canny", False))
                 use_depth = bool(payload.get("use_depth", False))  # optional
                 seed = int(payload.get("seed", 0))
                 if not image_path or not os.path.exists(image_path):
@@ -1502,6 +1438,7 @@ class Handler(BaseHTTPRequestHandler):
                     print("[ModelServer] SDXL not preloaded, loading on-demand...")
                     try:
                         from diffusers import StableDiffusionXLInpaintPipeline
+                        from diffusers import DPMSolverMultistepScheduler
                         device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
                         
                         # Load SDXL Inpainting
@@ -1511,6 +1448,10 @@ class Handler(BaseHTTPRequestHandler):
                             torch_dtype=torch.float16 if device == "cuda" else torch.float32
                         )
                         pipe = pipe.to(device)
+                        try:
+                            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+                        except Exception:
+                            pass
                         pipe.enable_attention_slicing()
                         if device == "cuda":
                             try:
@@ -1536,6 +1477,10 @@ class Handler(BaseHTTPRequestHandler):
                                     resume_download=True
                                 )
                                 pipe = pipe.to(device)
+                                try:
+                                    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+                                except Exception:
+                                    pass
                                 pipe.enable_attention_slicing()
                                 if device == "cuda":
                                     try:
@@ -1554,18 +1499,17 @@ class Handler(BaseHTTPRequestHandler):
                 # Fix: StableDiffusionXLInpaintPipeline doesn't have parameters() method
                 # Use the device it was loaded on instead
                 device = pipe.device if hasattr(pipe, 'device') else ("cuda" if torch.cuda.is_available() else "cpu")
-                dtype = torch.float16 if (device == "cuda") else torch.float32
                 try:
                     pipe = pipe.to(device)
-                    # Ensure component dtypes are consistent
+                    # Keep encoders in float32; UNet/VAE can be fp16 on CUDA
                     if hasattr(pipe, "unet"):
-                        pipe.unet.to(dtype=dtype)
+                        pipe.unet.to(dtype=(torch.float16 if device == "cuda" else torch.float32))
                     if hasattr(pipe, "vae"):
-                        pipe.vae.to(dtype=dtype)
+                        pipe.vae.to(dtype=(torch.float16 if device == "cuda" else torch.float32))
                     if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-                        pipe.text_encoder.to(dtype=dtype)
+                        pipe.text_encoder.to(dtype=torch.float32)
                     if hasattr(pipe, "text_encoder_2") and getattr(pipe, "text_encoder_2", None) is not None:
-                        pipe.text_encoder_2.to(dtype=dtype)
+                        pipe.text_encoder_2.to(dtype=torch.float32)
                 except Exception as _e:
                     print(f"[ModelServer] Warning: could not standardize SDXL component dtypes: {_e}")
 
@@ -1720,12 +1664,18 @@ class Handler(BaseHTTPRequestHandler):
                         out = out.resize((W, H), Image.LANCZOS)
                 except Exception:
                     pass
-                # Composite: keep original outside mask for precision
-                out_np = np.array(out)
-                orig_np = np.array(pil)
-                mask_np = np.array(mask)
-                mask_bin = (mask_np > 127).astype(np.uint8)
-                comp_np = np.where(mask_bin[..., None] == 1, out_np, orig_np)
+                # Composite with soft alpha to avoid seams at edges
+                out_np = np.array(out).astype(np.float32)
+                orig_np = np.array(pil).astype(np.float32)
+                mask_gray = np.array(mask).astype(np.float32) / 255.0
+                # Feather slightly for smoother boundaries
+                try:
+                    mask_gray = cv2.GaussianBlur(mask_gray, (5, 5), 0)
+                except Exception:
+                    pass
+                alpha = np.clip(mask_gray[..., None], 0.0, 1.0)
+                comp_np = out_np * alpha + orig_np * (1.0 - alpha)
+                comp_np = np.clip(comp_np, 0, 255).astype(np.uint8)
                 comp_img = Image.fromarray(comp_np)
                 b64 = np_to_jpeg_base64(comp_img)
                 return self._send(200, {"processedImageData": f"data:image/jpeg;base64,{b64}"})
