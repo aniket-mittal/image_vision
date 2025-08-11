@@ -9,7 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
-import { Crop, Lasso, MousePointer, Upload, Send, Bot, User, ChevronLeft, ChevronRight, Eraser } from "lucide-react"
+import { Crop, Lasso, MousePointer, Upload, Send, Bot, User, ChevronLeft, ChevronRight, Eraser, Image as ImageIcon, Undo, Redo } from "lucide-react"
 
 type Tool = "crop" | "lasso" | "object-selector" | null
 type Mode = "Ask" | "Edit"
@@ -43,6 +43,9 @@ export default function AIImageAnalyzer() {
   const [processingMode, setProcessingMode] = useState<ProcessingMode>("Original")
   const [aiModel, setAIModel] = useState<AIModel>("GPT")
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
+  const [workingImage, setWorkingImage] = useState<string | null>(null)
+  const [history, setHistory] = useState<string[]>([])
+  const [historyIndex, setHistoryIndex] = useState<number>(0)
   const [processedImage, setProcessedImage] = useState<string | null>(null)
   const [selections, setSelections] = useState<Selection[]>([])
   const [isDrawing, setIsDrawing] = useState(false)
@@ -67,6 +70,10 @@ export default function AIImageAnalyzer() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const toolbarRef = useRef<HTMLDivElement>(null)
+  const dprRef = useRef<number>(1)
+  const narrativeTimerRef = useRef<any>(null)
+  const narrativeQueueRef = useRef<string[]>([])
   const chatMessagesRef = useRef<HTMLDivElement>(null)
 
   // Auto-scroll chat to bottom when new messages arrive
@@ -75,6 +82,33 @@ export default function AIImageAnalyzer() {
       chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight
     }
   }, [messages, isLoading])
+
+  // Resize canvas to account for device pixel ratio and align with displayed image size
+  const resizeCanvasToImage = useCallback(() => {
+    const canvas = canvasRef.current
+    const img = imageRef.current
+    if (!canvas || !img) return
+    const dpr = window.devicePixelRatio || 1
+    dprRef.current = dpr
+    const cw = img.offsetWidth
+    const ch = img.offsetHeight
+    canvas.width = Math.max(1, Math.round(cw * dpr))
+    canvas.height = Math.max(1, Math.round(ch * dpr))
+    canvas.style.width = `${cw}px`
+    canvas.style.height = `${ch}px`
+    const ctx = canvas.getContext("2d")
+    if (ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    }
+  }, [])
+
+  useEffect(() => {
+    const onResize = () => resizeCanvasToImage()
+    window.addEventListener("resize", onResize)
+    return () => window.removeEventListener("resize", onResize)
+  }, [resizeCanvasToImage])
 
   // Draw blurred background with highlighted selection (crop or lasso)
   const drawHighlightOverlay = useCallback(
@@ -130,7 +164,11 @@ export default function AIImageAnalyzer() {
       if (shouldBlur) {
         ctx.save()
         ctx.filter = "blur(8px)"
-        ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height)
+        // Ensure we draw at device pixel scale to prevent perceived zoom
+        const dpr = dprRef.current || 1
+        const dw = Math.round(canvas.clientWidth * dpr)
+        const dh = Math.round(canvas.clientHeight * dpr)
+        ctx.drawImage(imgEl, 0, 0, dw, dh)
         ctx.restore()
       }
 
@@ -168,8 +206,8 @@ export default function AIImageAnalyzer() {
 
       // 5) If object-selector is active, draw detected object boxes as guidance
       if (selectedTool === "object-selector" && detectedObjects.length > 0 && imageNaturalSize) {
-        const scaleX = canvas.width / imageNaturalSize.w
-        const scaleY = canvas.height / imageNaturalSize.h
+        const scaleX = (canvas.clientWidth || canvas.width) / imageNaturalSize.w
+        const scaleY = (canvas.clientHeight || canvas.height) / imageNaturalSize.h
         ctx.save()
         ctx.strokeStyle = "rgba(255,255,255,0.6)"
         ctx.lineWidth = 1
@@ -193,7 +231,7 @@ export default function AIImageAnalyzer() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!input.trim() || !uploadedImage || isLoading) return
+    if (!input.trim() || !workingImage || isLoading) return
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -225,7 +263,7 @@ export default function AIImageAnalyzer() {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  imageData: uploadedImage,
+                  imageData: workingImage,
                   userQuery: input,
                   toolType: lastSelection.type,
                   coordinates: lastSelection.coordinates,
@@ -241,7 +279,7 @@ export default function AIImageAnalyzer() {
             }
           }
           let requestBody: any = {
-            imageData: uploadedImage,
+            imageData: workingImage,
             userQuery: input,
             mode: processingMode === "BlurDeep" ? "BlurDeep" : "BlurLight",
             aiModel,
@@ -325,9 +363,28 @@ export default function AIImageAnalyzer() {
       } else if (mode === "Edit") {
         // Invoke Edit agent: Upload → Analyze → Mask → Route → Execute → Validate → Return
         try {
+          const originalInstruction = userMessage.content
+          // Kick off LLM-driven narrative lines (non-blocking) for edit mode
+          try {
+            const narr = await fetch("/api/edit-narrative", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction: originalInstruction }) })
+            if (narr.ok) {
+              const nj = await narr.json()
+              if (Array.isArray(nj?.lines)) {
+                narrativeQueueRef.current = nj.lines
+                // Play out narrative lines during the edit with small cadence
+                if (narrativeTimerRef.current) clearInterval(narrativeTimerRef.current)
+                let idx = 0
+                narrativeTimerRef.current = setInterval(() => {
+                  if (idx >= narrativeQueueRef.current.length) { clearInterval(narrativeTimerRef.current); return }
+                  const line = narrativeQueueRef.current[idx++]
+                  setAgentEvents((prev) => [...prev, line])
+                }, 900)
+              }
+            }
+          } catch {}
           const body = {
-            imageData: uploadedImage,
-            instruction: input,
+            imageData: workingImage,
+            instruction: originalInstruction,
             aiModel,
           }
           const res = await fetch("/api/edit-agent", {
@@ -337,16 +394,45 @@ export default function AIImageAnalyzer() {
           })
           if (res.ok) {
             const data = await res.json()
-            if (data?.result) setProcessedImage(data.result)
+            if (data?.result) {
+              setProcessedImage(null)
+              setWorkingImage(data.result)
+              setHistory((prev) => {
+                const next = [...prev.slice(0, historyIndex + 1), data.result]
+                setHistoryIndex(next.length - 1)
+                return next
+              })
+            }
             // Log steps inline
             if (Array.isArray(data?.steps)) {
-              setAgentEvents((prev) => [
-                ...prev,
-                ...data.steps.map((s: any) => s.step + (s.info?.passed === false ? " (retry suggested)" : "")),
-              ])
-              const imgs = data.steps.filter((s: any) => s.image).map((s: any) => s.image as string)
-              if (imgs.length) setAgentStepImages((prev) => [...prev, ...imgs])
+              const friendly = data.steps.map((s: any) => {
+                const key = String(s.step || "").toLowerCase()
+                if (key.includes("upload")) return "Uploading image"
+                if (key.includes("analyze")) return "Analyzing instruction"
+                if (key.includes("face_parse")) return "Parsing face regions"
+                if (key.includes("lighting_target_mask")) return "Targeting region for lighting"
+                if (key === "mask" || key.includes("mask_openai_source")) return "Running segmentation"
+                if (key.includes("enhance_local")) return "Applying local enhancement"
+                if (key.includes("openai_images_edit") || key.includes("inpaint")) return "Running image generation"
+                if (key.includes("validate")) return "Running validation sequence"
+                if (key.includes("seamless_blend") || key.includes("blend")) return "Smoothing and blending"
+                return s.step
+              })
+              setAgentEvents((prev) => [...prev, ...friendly])
+            // Do not show step images in edit mode per request; clear any previous
+            setAgentStepImages([])
             }
+            // Ask LLM for a crisp final summary instead of hardcoding
+            try {
+              const sr = await fetch("/api/edit-summary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction: originalInstruction, steps: data?.steps || [] }) })
+              if (sr.ok) {
+                const sj = await sr.json()
+                const finalLine = sj?.summary || "Edit completed."
+                setMessages((prev) => [...prev, { id: (Date.now() + 2).toString(), role: "assistant", content: finalLine }])
+              }
+            } catch {}
+            // Stop narrative timer if running
+            if (narrativeTimerRef.current) { clearInterval(narrativeTimerRef.current); narrativeTimerRef.current = null }
           } else {
             console.error("Edit agent failed:", res.status, await res.text())
           }
@@ -375,7 +461,7 @@ export default function AIImageAnalyzer() {
             messages: [...messages, userMessage],
             processingMode,
             aiModel,
-            imageData: uploadedImage,
+            imageData: workingImage,
             processedImageData: processedImage,
               // For chat context, include the most recent ROI selection if any
               selection: (selections.filter((s) => s.type === "crop" || s.type === "lasso").slice(-1)[0] ?? null),
@@ -455,7 +541,11 @@ export default function AIImageAnalyzer() {
     if (file) {
       const reader = new FileReader()
       reader.onload = (e) => {
-        setUploadedImage(e.target?.result as string)
+        const dataUrl = e.target?.result as string
+        setUploadedImage(dataUrl)
+        setWorkingImage(dataUrl)
+        setHistory([dataUrl])
+        setHistoryIndex(0)
         setProcessedImage(null)
         setSelections([])
         setDetectedObjects([])
@@ -474,8 +564,9 @@ export default function AIImageAnalyzer() {
       if (!canvasRef.current || !selectedTool) return
 
       const rect = canvasRef.current.getBoundingClientRect()
-      const x = event.clientX - rect.left
-      const y = event.clientY - rect.top
+      const dpr = dprRef.current || 1
+      const x = (event.clientX - rect.left)
+      const y = (event.clientY - rect.top)
 
       setIsDrawing(true)
 
@@ -495,8 +586,8 @@ export default function AIImageAnalyzer() {
       if (!imageRef.current || !imageRef.current.complete) return
 
       const rect = canvasRef.current.getBoundingClientRect()
-      const x = event.clientX - rect.left
-      const y = event.clientY - rect.top
+      const x = (event.clientX - rect.left)
+      const y = (event.clientY - rect.top)
 
       if (selectedTool === "lasso") {
         setDrawPath((prev) => {
@@ -524,7 +615,7 @@ export default function AIImageAnalyzer() {
       const selectionData: Selection = {
         type: selectedTool,
         coordinates: drawPath,
-        imageData: uploadedImage,
+        imageData: workingImage,
       }
       setSelections((prev) => {
         const next = [...prev, selectionData]
@@ -534,7 +625,7 @@ export default function AIImageAnalyzer() {
       })
       setDrawPath([])
     }
-  }, [isDrawing, drawPath, selectedTool, uploadedImage, drawHighlightOverlay])
+  }, [isDrawing, drawPath, selectedTool, workingImage, drawHighlightOverlay])
 
   const handleObjectSelect = useCallback(async (event: React.MouseEvent<HTMLCanvasElement>) => {
     if (selectedTool !== "object-selector") return
@@ -614,7 +705,7 @@ export default function AIImageAnalyzer() {
 
   // Helper: run SAM with multiple click points (original-image coordinates)
   const runSamMultiClick = useCallback(async (points: Array<{ x: number; y: number }>) => {
-    if (!uploadedImage) return
+    if (!workingImage) return
     if (!points || points.length === 0) {
       setProcessedImage(null)
       return
@@ -623,14 +714,14 @@ export default function AIImageAnalyzer() {
     const res = await fetch("/api/objects", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ imageData: uploadedImage, points, blurStrength: 15 }),
+      body: JSON.stringify({ imageData: workingImage, points, blurStrength: 15 }),
     })
     if (!res.ok) return
     const data = await res.json()
     if (!data.processedImageData) return
     setProcessedImage(data.processedImageData)
     console.log("[ObjectSelector] SAM-multi-click done")
-  }, [uploadedImage])
+  }, [workingImage])
 
   // Clear overlay when selection is cleared or image changes
   useEffect(() => {
@@ -665,22 +756,31 @@ export default function AIImageAnalyzer() {
     }
   }, [mode])
 
-  // When an image is uploaded, detect all objects and cache them
+  // When an image is uploaded or changes, detect all objects and cache them
+  // Only auto-highlight if user explicitly chose Object Selector and we're not in Edit flow
   useEffect(() => {
     const detect = async () => {
-      if (!uploadedImage) return
+      if (!workingImage) return
       try {
         setIsDetectingObjects(true)
         const res = await fetch("/api/objects", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ imageData: uploadedImage, prompt: "object" }),
+          body: JSON.stringify({ imageData: workingImage, prompt: "object" }),
         })
         if (res.ok) {
           const data = await res.json()
           setDetectedObjects(data.objects || [])
-          // Auto-highlight first object once per image
-          if (!hasAutoHighlighted && (data.objects || []).length > 0 && imageRef.current && imageNaturalSize) {
+          // Auto-highlight first object once per image, but ONLY when the Object Selector tool is active
+          // and we're in Ask mode. This avoids accidental activation during Edit/generative fills.
+          if (
+            !hasAutoHighlighted &&
+            selectedTool === "object-selector" &&
+            mode === "Ask" &&
+            (data.objects || []).length > 0 &&
+            imageRef.current &&
+            imageNaturalSize
+          ) {
             const first = data.objects[0]
             const [x1, y1, x2, y2] = first.bbox as number[]
             const cx = Math.round((x1 + x2) / 2)
@@ -690,7 +790,7 @@ export default function AIImageAnalyzer() {
             // Build overlay selection box scaled to canvas
             const sX = imageRef.current.offsetWidth / imageNaturalSize.w
             const sY = imageRef.current.offsetHeight / imageNaturalSize.h
-            const sel: Selection = { type: "object-selector", coordinates: [x1 * sX, y1 * sY, x2 * sX, y2 * sY], imageData: uploadedImage }
+            const sel: Selection = { type: "object-selector", coordinates: [x1 * sX, y1 * sY, x2 * sX, y2 * sY], imageData: workingImage }
             const merged = [...selections.filter((s) => s.type !== "object-selector"), sel]
             setSelections(merged)
             drawHighlightOverlay(merged)
@@ -705,7 +805,7 @@ export default function AIImageAnalyzer() {
       }
     }
     detect()
-  }, [uploadedImage])
+  }, [workingImage, selectedTool, mode])
 
   return (
     <div className="flex h-screen bg-gray-50">
@@ -714,7 +814,18 @@ export default function AIImageAnalyzer() {
         {/* Toolbar */}
         <div className="bg-white border-b p-4">
           <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-4">
+            <div ref={toolbarRef} className="flex items-center space-x-4">
+              {/* Quick Upload */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                title="Upload Image"
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Upload Image
+              </Button>
+              <Separator orientation="vertical" className="mx-2 h-6" />
               <Button
                 variant={selectedTool === "crop" ? "default" : "outline"}
                 size="sm"
@@ -745,6 +856,54 @@ export default function AIImageAnalyzer() {
                 <MousePointer className="w-4 h-4 mr-2" />
                 Object Selector
               </Button>
+              {/* History controls */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (!uploadedImage) return
+                  setWorkingImage(uploadedImage)
+                  setHistoryIndex(0)
+                  setProcessedImage(null)
+                }}
+                disabled={!uploadedImage || !workingImage}
+                title="Original Image"
+              >
+                <ImageIcon className="w-4 h-4 mr-2" />
+                Original Image
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (historyIndex <= 0) return
+                  const idx = historyIndex - 1
+                  setHistoryIndex(idx)
+                  setWorkingImage(history[idx])
+                  setProcessedImage(null)
+                }}
+                disabled={historyIndex <= 0}
+                title="Revert"
+              >
+                <Undo className="w-4 h-4 mr-2" />
+                Revert
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (historyIndex >= history.length - 1) return
+                  const idx = historyIndex + 1
+                  setHistoryIndex(idx)
+                  setWorkingImage(history[idx])
+                  setProcessedImage(null)
+                }}
+                disabled={historyIndex >= history.length - 1}
+                title="Next"
+              >
+                <Redo className="w-4 h-4 mr-2" />
+                Next
+              </Button>
               {selections.length > 0 && (
                 <Button
                   variant="outline"
@@ -774,11 +933,11 @@ export default function AIImageAnalyzer() {
         {/* Image Display Area */}
         <div className="flex-1 flex items-center justify-center p-8 relative min-h-0 overflow-hidden">
           {/* Detect-all progress bar removed per request */}
-          {uploadedImage ? (
+          {workingImage ? (
             <div className="relative w-full h-full">
               <img
                 ref={imageRef}
-                src={processedImage || uploadedImage || "/placeholder.svg"}
+                src={processedImage || workingImage || "/placeholder.svg"}
                 alt="Uploaded"
                 className="w-full h-full object-contain"
                 onLoad={() => {
@@ -786,10 +945,7 @@ export default function AIImageAnalyzer() {
                     const canvas = canvasRef.current
                     const img = imageRef.current
                     setImageNaturalSize({ w: img.naturalWidth, h: img.naturalHeight })
-                    canvas.width = img.offsetWidth
-                    canvas.height = img.offsetHeight
-                    canvas.style.width = `${img.offsetWidth}px`
-                    canvas.style.height = `${img.offsetHeight}px`
+                    resizeCanvasToImage()
                     // Redraw overlay, if there are existing selections
                     if (selections && selections.length > 0) {
                       drawHighlightOverlay(selections)
@@ -1053,13 +1209,13 @@ export default function AIImageAnalyzer() {
                     value={input}
                     onChange={handleInputChange}
                     placeholder="Ask about the image..."
-                    disabled={!uploadedImage || isLoading}
+                    disabled={!workingImage || isLoading}
                     className="pr-10 h-10 text-sm"
                   />
                 </div>
                 <Button
                   type="submit"
-                  disabled={!uploadedImage || isLoading || !input.trim()}
+                  disabled={!workingImage || isLoading || !input.trim()}
                   size="sm"
                   className="h-10 w-10 p-0"
                 >
